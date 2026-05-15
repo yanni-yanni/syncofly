@@ -1035,15 +1035,6 @@ const DRASTIC_THRESHOLD=0.10,IOI_MIN=0.5,IOI_MAX=8.0;
 
 class M4p{
   constructor(initPeriod){
-    // NOTE on time scale: in the Python reference simulation, t starts at 0.0
-    // (sim-relative seconds), so initializing last_onset_time to 0.0 also serves
-    // as a valid starting anchor. In this JS port, t is performance.now()/1000
-    // (wall-clock seconds, a large number at launch). We initialize last_onset_time
-    // to -1 instead so the bootstrap branch in process_event ("if last_onset_time<0:
-    // last_onset_time=t; return") correctly anchors on the FIRST received audio
-    // event. Without this, early phase calculations are computed against an
-    // arbitrary anchor (0) and the model fires garbage beats before the first
-    // source event ever arrives.
     this.cycle_period=initPeriod;
     this.last_onset_time=-1.0;  // -1 sentinel: bootstrap anchor on first event
     this.last_sim_time=0.0;
@@ -1060,14 +1051,13 @@ class M4p{
     this._react_min_dur=1.0;this._reactive_taps=[];
     this._last_react_tap=-999.0;this._miss_window=[];
     // Cross-frame refractory: prevents re-firing within 50ms of the last emitted tap
-    // (mirrors Python's pp/cp window which naturally blocks re-crossing the same tick)
     this._lastTapFiredT=-999.0;
     this._lastDownbeatT=-999.0;
     this._predictedDownbeatT=-999.0;
     this._drasticReset=false;
     this._pendingPatternSwitch=false; // set by applySwitch; cleared on first post-switch downbeat
     this.phase=0.0;this.confidence=0.0;
-    // dbFlash for visual pulse (not in Python, added for display)
+    // dbFlash for visual pulse.
     this._dbFlash=0.0;
   }
   tickStep(t){
@@ -1115,7 +1105,7 @@ class M4p{
       this.last_sim_time=t;return gen;
     }
     if(this.last_onset_time<0){this.last_sim_time=t;return[];}
-    // Keep generating during silence if structural memory exists (v7 fix retained)
+    // Keep generating during silence if structural memory exists.
     const memConfident=this.structural_memory!==null;
     const silentThresh=this.cycle_period*1.5;
     if((t-this.last_obs_time)>silentThresh&&!memConfident){this.last_sim_time=t;return[];}
@@ -1127,18 +1117,6 @@ class M4p{
     const active_ticks=new Set();
     if(use_mem){for(const ls of this.structural_memory)for(const tk of ls.ticks)active_ticks.add(Math.round(tk*1e4)/1e4);}
     else{
-      // Active-tick selection: original rule was simply `w > 0.5`. This
-      // misbehaves during meter switches: when L2=1.0 (entrenched 4/4) and
-      // L3 climbs above 0.5 (3/4 evidence accumulating), BOTH layers are
-      // active and the agent fires {0, ¼, ⅓, ½, ⅔, ¾} per cycle — the
-      // "spurious beeping" symptom. To fire ticks for a layer it must be
-      // (a) above the absolute floor (0.5) AND (b) within `META_GAP` of
-      // the maximum weight across layers. The gap rule preserves genuine
-      // polyrhythm support (when both layers entrain the polyrhythm cipher
-      // their weights both climb to ~1.0 → gap ≈ 0 → both active) while
-      // eliminating the cross-fire during a hesitant transition (L2=1.0,
-      // L3=0.55 → gap=0.45 > META_GAP → only L2 active until L3 actually
-      // takes over, after which Fix 2A drops L2 below 0.5 quickly).
       const META_GAP=0.30;
       const maxW=Math.max(this.layers[2].w, this.layers[3].w);
       for(const[,l]of Object.entries(this.layers)){
@@ -1161,10 +1139,6 @@ class M4p{
       // Within-frame deduplication (Python: 50ms gap between consecutive taps)
       const deduped=[raw[0]];
       for(const r of raw.slice(1))if(r.time-deduped[deduped.length-1].time>0.05)deduped.push(r);
-      // Cross-frame refractory: mirror Python's natural pp/cp tick-crossing guard.
-      // In Python, once last_sim_time advances past a tick, that tick cannot re-cross.
-      // In JS, all raw entries carry (t + LATENCY_MOTOR) so the same tick can re-fire
-      // next frame if last_sim_time didn't advance far enough. Gate with 50ms refractory.
       const REFRACTORY = 0.050; // 50 ms — matches Python's minimum inter-tap gap
       for(const item of deduped){
         if(item.time - this._lastTapFiredT >= REFRACTORY){
@@ -1183,7 +1157,7 @@ class M4p{
     this.last_sim_time=t;return gen;
   }
   process_proprioception(t,audio_t){
-    // Python uses a deque; JS uses array; drain front
+    // JS uses array; drain front
     while(this.proprio_q.length>0&&this.proprio_q[0]<=t){
       const pt=this.proprio_q.shift();
       if(Math.abs(t-audio_t)<0.25)this.active_off+=0.2*((audio_t-pt)/this.cycle_period);
@@ -1200,23 +1174,6 @@ class M4p{
         if(IOI_MIN<ioi&&ioi<IOI_MAX){
           const ratio=ioi/this.cycle_period;
           const nearestMultiple = Math.round(ratio);
-          // isMissedBeat: a long downbeat-to-downbeat IOI may simply mean N-1 beats
-          // were dropped (omissions), not that the period has changed. But we should
-          // only infer missed beats when the structural memory actually contains ticks
-          // at the intermediate positions (1/N, 2/N, ..., (N-1)/N). If those positions
-          // are NOT in the pattern, the long gap reflects a genuine period change, and
-          // the drastic-reset path must be allowed to fire.
-          //
-          // Example of the bug this fixes: user sets period=4s, 8-beat pattern
-          // (ticks at 0, 0.125, 0.25, ... fractions). Model starts at 2s (or gets
-          // stuck at 2s). First downbeat IOI = 4s → ratio=2. Old code: isMissedBeat=true
-          // (nearestMultiple=2, abs(2-2)=0<0.18) → drastic blocked → period never updates.
-          // But the pattern has NO tick at 0.5 (the only intermediate position for N=2),
-          // so there was no "skipped beat" — it's a real 4-second period.
-          //
-          // New check: isMissedBeat is only true when ALL intermediate positions
-          // k/nearestMultiple (k=1..nearestMultiple-1) have a matching tick in
-          // structural memory (within a loose 0.06-fraction tolerance).
           let isMissedBeat = false;
           if(this.structural_memory !== null
               && nearestMultiple >= 2 && nearestMultiple <= 6
@@ -1237,10 +1194,7 @@ class M4p{
             // If structural_memory is present but empty ticks, fall through to drastic.
           }
           const drastic=!isMissedBeat && Math.abs(1.0-ratio)>DRASTIC_THRESHOLD;
-          // Period-adaptive EMA: at short cycle periods JS timing jitter is a larger
-          // fraction of the IOI, so use a gentler alpha to prevent noisy IOIs from
-          // destabilising the estimate. Scales 0.35 at 0.6s → 0.5 at 2.0s (capped).
-          // Drastic resets always snap (alpha=0.9) regardless of period.
+          // Period-adaptive EMA.
           const softAlpha=drastic?0.9:Math.min(0.5,0.35+0.15*(this.cycle_period-0.6)/1.4);
           this.cycle_period=(1-softAlpha)*this.cycle_period+softAlpha*ioi;
           if(drastic){
@@ -1254,75 +1208,18 @@ class M4p{
             }
           }else{
             this._drasticReset=false;
-            // Symmetric meter-switch fix (was: hard-coded binary prior).
-            //
-            // Python ref: this branch unconditionally floored layer 2 at 0.6
-            // on every non-drastic downbeat — i.e., the binary layer was
-            // refreshed on every cycle regardless of which meter was actually
-            // active. That is the binary bias the user identified: even after
-            // 3/4 evidence has driven L2 below 0.5, the next source downbeat
-            // pulls L2 right back up to 0.6, preventing the meter switch
-            // from completing. The asymmetry is one-way: from 3/4→4/4 it's
-            // benign (L2 was already going to be the winner), but from
-            // 4/4→3/4 it's the dominant cause of failed adaptation.
-            //
-            // Symmetric replacement: boost whichever layer is CURRENTLY
-            // dominant. This preserves the original intent — downbeats
-            // reinforce the entrained meter — without privileging binary.
-            // Tie-break on equal weights still goes to L2 (preserves a
-            // mild, principled prior on simple meters at startup, when
-            // both layers have equal weight from initialization or when
-            // they're genuinely tied during a polyrhythm).
             const domG = this.layers[2].w >= this.layers[3].w ? 2 : 3;
             this.layers[domG].w = Math.max(0.6, this.layers[domG].w);
           }
         }
       }
       this.last_period_update=t;
-      // ── CYCLE-ANCHOR RESYNC to source A downbeat ──
-      // After the beat-position grid (sub-beat ticks) are learned, last_onset_time
-      // can drift from source A's actual cycle boundary because fine-tuning in the
-      // sub-beat matching path aligns to the nearest tick (which may NOT be tick=0).
-      // This manifests as agents playing the right beats but with the cycle offset
-      // from source A's phase — i.e., when source fires its downbeat, the agent
-      // thinks it is on beat 2 or 3. Fix: on every non-drastic source downbeat, if
-      // the model is already anchored (last_onset_time > 0), compute how far the
-      // current anchor is from a downbeat alignment with t, and pull it toward t.
-      //
-      // Pattern-switch tightening: previously the pull only fired for
-      // errFrac<0.15 (small error) and α was a fixed 0.35. After 4/4→3/4→4/4
-      // the agent's anchor at the end of phase B can sit at a 3/4-grid
-      // position that is offset from the new 4/4 cycle by a moderate amount
-      // (errFrac ~0.10–0.30, depending on when the switch fires), and at
-      // α=0.35 it took 4–5 cycles to fully converge — long enough that the
-      // user perceives the agent's downbeats as not lined up with source A
-      // for the first half of the recovery window. New behavior: the pull
-      // applies for errFrac<0.40, with α scaled from 0.45 (small error) up
-      // to 0.75 (large error). Errors ≥0.40 still fall through to the hard
-      // reset on the next downbeat (dtz>0.15 branch above), which already
-      // bumps volatility and re-anchors fully.
       if(this.last_onset_time > 0 && !this._drasticReset){
         const cp = Math.max(0.1, this.cycle_period);
         const elapsed = t - this.last_onset_time;
         const nearestCycleT = this.last_onset_time + Math.round(elapsed / cp) * cp;
         const anchorErr = t - nearestCycleT;
         const errFrac = Math.abs(anchorErr) / cp;
-        // ── POST-PATTERN-SWITCH SNAP ──
-        // When a pattern switch just occurred (flagged by applySwitch via
-        // _pendingPatternSwitch), the agent's last_onset_time may be anchored
-        // to the previous pattern's downbeat grid. The first confirmed high-
-        // amplitude source-A downbeat (amp≥0.8 — we are inside that branch)
-        // carries the true cycle boundary. Rather than waiting for the gradual
-        // soft-pull to converge over several cycles, snap the anchor nearly all
-        // the way in one shot. Amplitude≥0.8 is the confirmation signal: it
-        // tells us this IS the downbeat, not noise or a sub-beat. After the
-        // snap, clear the flag so normal jitter correction resumes.
-        //
-        // For all other cases: graduated pull scaled by error fraction. Ceiling
-        // of 0.50 (maximum circular error) catches wrong-downbeat locks where
-        // the soft pull wouldn't otherwise fire; α=0.90 in that band snaps the
-        // anchor fully in one cycle. Normal jitter uses a proportional pull
-        // (α 0.45→0.75) so small errors converge smoothly.
         if(this._pendingPatternSwitch){
           // Full snap (α=0.95) regardless of errFrac.
           // Not 1.0 to avoid discrete-time overshoot from latency jitter.
@@ -1337,7 +1234,6 @@ class M4p{
       }
       // dbFlash now driven by predicted tick≈0 in generate_motor_commands, not stimulus
     }
-    // Python: last_onset_time starts at 0.0, so this branch only runs if explicitly set <0
     if(this.last_onset_time<0){this.last_onset_time=t;return;}
     const td=t-this.last_onset_time;
     // Wrap raw_phase to [0,1) properly. JS's % returns negative for negative td,
@@ -1346,16 +1242,14 @@ class M4p{
     // wall-clock vs sim-time jitter at frame boundaries).
     const rp=((td%this.cycle_period)/this.cycle_period+1)%1;
     const dtz=Math.min(rp,1.0-rp);
-    // Python: dtz > 0.15 (not 0.20)
     if(amp>0.8&&dtz>0.15){
       this.last_onset_time=t;this.last_reset=t;
-      this.volatility+=0.5;this.pending=[];  // Python: += 0.5 not 0.4
+      this.volatility+=0.5;this.pending=[];
       if(!this.reactive_mode&&this.last_period_update>0){
         this._enter_reactive(t);this._reactive_taps.push(t+LATENCY_MOTOR);
       }
       return;
     }
-    // Python: volatility > 0.9: decay -0.1 per layer (not -0.08)
     if(this.volatility>0.9){
       for(const g of[2,3]){
         const l=this.layers[g];
@@ -1364,7 +1258,6 @@ class M4p{
       }
     }
     const raw_phase=((td%this.cycle_period)/this.cycle_period+1)%1;
-    // Python: skip if raw_phase < 0.02 or > 0.98
     if(raw_phase<0.02||raw_phase>0.98){
       if(this._should_enter_reactive(t))this._enter_reactive(t);
       if(this.reactive_mode)this._reactive_taps.push(t+LATENCY_MOTOR);
@@ -1374,16 +1267,11 @@ class M4p{
     for(const[gk,l]of Object.entries(this.layers)){
       const g=parseInt(gk);
       const bd=Math.min(...l.ticks.map(tk=>Math.min(Math.abs(raw_phase-tk),1.0-Math.abs(raw_phase-tk))));
-      // Period-relative tolerance: target a ~40 ms real-time window expressed as a cycle
-      // fraction (= 0.040 / cycle_period). At slow tempos this is smaller than the
-      // proportional floor (0.04/l.res) so the proportional value wins; at fast tempos
-      // the real-time floor prevents the window from collapsing below ~40 ms wall-clock.
       const _cp=Math.max(0.1,this.cycle_period);
       const matchTol=Math.max(0.04/l.res, 0.040/_cp);
       if(bd<matchTol){
         cands.push({g,type:'current',err:bd});
       }else if(t>this.layer_supp[g]&&this.volatility<0.5){
-        // Python: try_res goes up to 4 (range l.res+1, 5)
         for(let try_res=l.res+1;try_res<=4;try_res++){
           const d=g*Math.pow(2,try_res-1);
           const nts=Array.from({length:d},(_,i)=>i/d);
@@ -1394,54 +1282,21 @@ class M4p{
         }
       }
     }
-    // Python: passive decay -0.015 (not -0.02)
     for(const g of[2,3])this.layers[g].w=Math.max(0.05,this.layers[g].w-0.015);
     // Pre-upgrade miss (Condition 4)
     const all_cur=Object.values(this.layers).filter(l=>l.w>0.3).flatMap(l=>l.ticks);
     const pre_miss=all_cur.length>0?Math.min(...all_cur.map(tk=>Math.min(Math.abs(raw_phase-tk),1.0-Math.abs(raw_phase-tk)))):0.0;
     if(cands.length>0){
-      // Python uses min(cands, key=lambda x: x['err']) which returns the FIRST
-      // minimum element on ties. JS reduce with `<` returns the LAST. Tie-break
-      // matters: when L2 and L3 both match perfectly (err=0), L2 should win
-      // (current match, +0.4 boost), not L3 (upgrade, +0.5 boost). Wrong tie-break
-      // causes a perfectly-locked binary pattern to keep upgrading the ternary
-      // layer to a 6-tick grid that fires extra spurious sub-beat ticks.
       let best = cands[0];
       for(let i=1; i<cands.length; i++){
         if(cands[i].err < best.err) best = cands[i];
       }
       const l=this.layers[best.g];
-      // Python: +0.5 on upgrade, +0.4 on current match
       if(best.type==='upgrade'){l.res=best.target_res;this._update_ticks(best.g);l.w=Math.min(1.0,l.w+0.5);}
       else{l.w=Math.min(1.0,l.w+0.4);}
       const og=best.g===2?3:2;
       const ol=this.layers[og];
       const obd=Math.min(...ol.ticks.map(tk=>Math.min(Math.abs(raw_phase-tk),1.0-Math.abs(raw_phase-tk))));
-      // Off-layer penalty. Original Python: flat -0.1.
-      //
-      // Asymmetric-meter-switch fix: when the dominant layer is saturated near
-      // 1.0 (e.g. L2 after long 4/4 baseline), a flat -0.1 cannot decay it
-      // below 0.5 within the perturbation window. Per cycle of 3/4 from a 4/4
-      // baseline: 2 sub-beat events × -0.115 = -0.23 → ~3 cycles to drop L2
-      // out, which is too slow given that the 3/4 phase is itself only a few
-      // cycles long. This produces the observed "spurious beeping" (both
-      // layers active simultaneously, agent fires {0,¼,⅓,½,⅔,¾} per cycle
-      // instead of just {0,⅓,⅔}) and means the meter-switch never resolves.
-      //
-      // Scaled penalty: -0.1 - 0.10*ol.w. At ol.w=1.0 the penalty is -0.20
-      // (2× original), at ol.w=0.5 it's -0.15 (1.5× original), at low weights
-      // it's near the original. Calibrated so:
-      //   • 4/4→3/4 transition: L2 drops below 0.5 in ~1.5 cycles instead
-      //     of never (with the binary-prior boost) or ~3 cycles (without
-      //     the prior).
-      //   • 3/4→4/4 transition: L3 drops below 0.5 in ~1 cycle, similar
-      //     to original.
-      //   • Polyrhythm cipher (events at {0, ⅓, ½, ⅔}): L2 reaches an
-      //     equilibrium of ~0.7 (above the 0.5 active-tick threshold)
-      //     instead of saturating to 1.0 — both layers still active and
-      //     fire their respective ticks. A stronger scale (e.g. 0.15)
-      //     would push L2 below 0.5 in polyrhythm, breaking it.
-      // Symmetric for both directions of meter switch.
       if(obd>=0.05)ol.w=Math.max(0.05, ol.w - 0.1 - 0.10*ol.w);
       if(this.volatility<0.5){
         const sl=this.layers[best.g];let mds=1.0;
@@ -1450,12 +1305,6 @@ class M4p{
           if(d>0.5)d-=1.0;else if(d<-0.5)d+=1.0;
           if(Math.abs(d)<Math.abs(mds))mds=d;
         }
-        // Python: 0.3 * mds (not 0.25)
-        // Period-scaled gain: at short periods many phase corrections fire per unit
-        // time, so we reduce the per-event gain proportionally. The gain is 0.3 at
-        // period=2.0s (the Python-calibrated reference) and scales linearly down to
-        // 0.09 at period=0.6s. This is meter-agnostic — it does not divide by the
-        // layer tick count, which would under-correct ternary and other non-binary grids.
         const phaseGain = 0.3 * Math.min(1.0, this.cycle_period / 2.0);
         this.cycle_period+=phaseGain*(mds*this.cycle_period);
         this.last_onset_time=t-((raw_phase-mds)*this.cycle_period);
@@ -1481,7 +1330,6 @@ class M4p{
   check_missed_predictions(t){
     if(this.last_onset_time<0)return;
     const tso=t-this.last_obs_time;
-    // Python: is_silent threshold = cycle_period * 1.01 (not 1.5)
     const is_silent=tso>(this.cycle_period*1.01);
     const pp=(this.last_sim_time-0.005-this.last_onset_time)/this.cycle_period;
     const cp=(t-this.last_onset_time)/this.cycle_period;
@@ -1490,12 +1338,10 @@ class M4p{
       const g=parseInt(g_str);if(l.w<0.05)continue;
       for(const tk of l.ticks){
         let tgt=Math.floor(pp)+tk;if(tgt<pp)tgt+=1.0;
-        // Python: 0.02 < (tgt%1) < 0.98
         if(pp<=tgt&&tgt<cp&&0.02<(tgt%1.0)&&(tgt%1.0)<0.98)
           this.pending.push({time:this.last_onset_time+tgt*this.cycle_period,g,tick:tk});
       }
     }
-    // Python: check at t > pred.time + 0.1, window = 0.04 * cycle_period, penalty -0.3
     const still=[];
     for(const pred of this.pending){
       if(t<pred.time+0.1){still.push(pred);continue;}
@@ -1504,9 +1350,6 @@ class M4p{
         const l=this.layers[pred.g];
         l.w=Math.max(0.0,l.w-0.3);  // Python: -0.3 not -0.22
         if(l.w<0.4&&l.res>1){l.res--;this._update_ticks(pred.g);
-          // Period-relative suppression: block upgrade attempts for 2 cycles.
-          // At 1.0s fixed this was 1.67 cycles at 0.6s but only 0.5 cycles at 2.0s.
-          // 2 × cycle_period gives consistent protection regardless of tempo.
           this.layer_supp[pred.g]=t+2.0*this.cycle_period;}
       }
     }
@@ -1539,42 +1382,20 @@ class Robot{
     // Each entry: {phase: 0..1 within cycle, t: wallclock seconds, isDownbeat: bool}
     this.emittedBeatPhases=[];
     // Per-source refractory tracker: sourceId → last event time received from that source.
-    // Prevents the same beat from being counted twice if it reaches the agent via more
-    // than one path (e.g. two neighbors both broadcast a beat the agent already heard).
     this._lastEventBySource = new Map();
-    // Source-A authority: tracks most recent Source A event time. While A has
-    // been heard within the last ~2 cycles, peer events do not feed the model.
-    // -999 means "never heard A" — peers can drive the model from the start.
+    // Source-A authority: tracks most recent Source A event time.
     this._lastSourceAEventT = -999;
     // Second-to-last Source A event time. Used to estimate A's local cycle period
     // for the multi-source conformity check: an incoming peer beat is "on grid"
-    // iff its time, modulo (lastA - prevA), is close to zero relative to lastA.
+    // if its time, modulo (lastA - prevA), is close to zero relative to lastA.
     this._prevSourceAEventT = -999;
-    // Last time a peer event was allowed to drive process_event. Used to enforce
-    // a τ_min-style rate limit on peer-driven model updates: an echo cascade can
-    // accelerate the group's effective tempo by feeding the model more events
-    // per cycle than the rhythm structure supports. The reactive-output τ_min in
-    // §3.3.1 of the writeup prevents this for reactive agents; the predictive
-    // analogue is to cap the rate at which peer events can update the predictive
-    // model, since after a peer beat reinforces the model the next predicted
-    // tap fires sooner, broadcasts sooner, and accelerates neighbors in turn.
-    // Source A drives are exempt — A is the canonical timing reference.
+    // Last time a peer event was allowed to drive process_event.
     this._lastPeerDriveT = -999;
-    // Recent peer events (rolling buffer, ~1.5 cycles deep) for the cross-reference
-    // consensus check: when a peer beat arrives, count how many OTHER peers fired
-    // within a small window around the same expected grid slot. Majority agreement
-    // boosts each peer's effective weight; an isolated outlier (the noisy agent)
-    // gets attenuated. Each entry: {sourceId, t}.
+    // Recent peer events (rolling buffer, ~1.5 cycles deep) for cross-reference.
+
     this._recentPeerEvents = [];
     // Simultaneous-peer cluster collapse: tracks most recent peer event time.
-    // If multiple peers fire the same beat within 50ms, treat as one event so
-    // their crowd doesn't inflate the agent's apparent IOI when A is silent.
     this._lastAnyPeerEventT = -999;
-    // Authority source ID: the source this agent treats as canonical.
-    //   'A'        — Source A (default; used in open/orbit mode for all agents,
-    //                and in bottleneck mode for B1)
-    //   'peer:N'   — chain upstream peer (used in bottleneck for B2..B5)
-    // Set by buildSim per environment mode.
     this._authoritySourceId = 'A';
     this.firstSyncT=-1;this.corruptedAtShock=false;this.corruptType=null;this.recoverT=-1;
     // Bottleneck sequential activation state
@@ -1597,94 +1418,14 @@ class Robot{
     // immediately on each accepted incoming sound (no forward prediction), but
     // still apply the same source-distinguishing/weighing logic as predictive
     // agents (per-source refractory, authority gate, cluster collapse, falloff,
-    // source weight, downbeat threshold). Without that gating, echoing every
-    // peer broadcast collapses the network into a runaway feedback loop where
-    // beats compress into one fast spurious chain.
-    //   _reactiveTaps        : queue of pending taps to fire this/next frame.
-    //                          Each entry: {time, isDownbeat}. Drained in tick().
-    //   _reactiveLastEventT  : wall-clock time of most recent ACCEPTED event from
-    //                          the authority source. Used to estimate IOI for
-    //                          orbit-radius scaling and visual phase only — never
-    //                          for prediction.
-    //   _reactiveCyclePeriod : EMA of observed authority IOIs. Mirrors the role
-    //                          of model.cycle_period in predictive agents so that
-    //                          orbit radius/step-size and phase visualization
-    //                          look the same. NOT used to schedule any future tap.
+    // source weight, downbeat threshold).
     this._reactiveTaps=[];
     this._reactiveLastEventT=-999;
     this._reactiveCyclePeriod=INIT_CYCLE_PERIOD;
     this._reactiveLastTapT=-999;
     this._reactiveLastDownbeatT=-999; // for downbeat-to-downbeat cycle-period estimation
   }
-  // Receive a real audio event (one beat from a real source).
-  //   t           : audio time of the beat (NOT the current frame time)
-  //   amp         : event amplitude as defined by stimulus generation (1.0 downbeat,
-  //                 0.6 mid-cycle, 0.2 weak — matches Python script)
-  //   sourceId    : 'A' for Source A, or 'peer:<id>' for another agent. Used for
-  //                 per-source refractory so the same beat heard from multiple paths
-  //                 does not double-count, and for source-weight gating.
-  //   distance    : distance in px from the source to this agent (for falloff)
-  //   reach       : the source's reach radius in px (Source A reach or peer hearingR)
-  //   isDownbeat  : whether this is a stimulus-defined downbeat. Used to preserve
-  //                 the downbeat amplitude threshold (≥0.8) for the model even if
-  //                 distance falloff would otherwise degrade amp below it. Without
-  //                 this guard, distance kills the downbeat-update branch in M4p.
-  //
-  // MULTI-SOURCE WEIGHTED AUTHORITY (open/orbit mode):
-  // The agent listens to Source A AND its peers, but heavily prioritizes A. The
-  // physical analogy: a group of dancers follows the conductor on stage as the
-  // primary timing reference, while still cross-checking each other in their
-  // immediate hearing range. A single off-rhythm neighbor doesn't derail the
-  // group — the majority of correctly-entrained peers reinforce each other and
-  // overpower the outlier, and everyone keeps anchoring to the conductor.
-  //
-  // Concretely, when a peer event arrives and Source A has been heard recently:
-  //   1. Predict the A grid: from the last two Source A event times we estimate
-  //      A's local cycle period and project forward expected beat times.
-  //   2. Conformity to A: how close is this peer's beat to the nearest expected
-  //      A-grid time? On-grid → factor near 1. Far off-grid (e.g. a phantom
-  //      beat from a noisy agent at ±40% of cycle) → factor near 0.
-  //   3. Peer consensus: how many OTHER peers within hearing range fired a
-  //      similar on-grid beat in the recent window? Multiple agreeing peers
-  //      reinforce each other; an isolated outlier sits alone and gets minimal
-  //      boost. If only one peer is in range, this term gracefully degrades to
-  //      a neutral value (no boost, no penalty) — partial-hearing agents still
-  //      function purely on the A-conformity term.
-  //   4. The peer event drives the model with effective amplitude
-  //      base × conformity × consensusBoost, capped well below A's own weight
-  //      so A always dominates timing.
-  //   5. If the resulting amplitude is below a small floor (sub-noise), the
-  //      model update is skipped — the visual ripple still fired earlier so the
-  //      user sees that the agent IS hearing the peer; it just doesn't trust
-  //      that beat enough to act on it.
-  //
-  // When Source A is silent (out of range, perturbed, or never heard), peers
-  // fall back to driving the model directly with their full base weight — the
-  // existing relay-network behavior is preserved, so bottleneck-style chains
-  // and peer-only conditions still work.
-  //
-  // Bottleneck mode (this._authoritySourceId !== 'A') keeps the strict
-  // single-upstream-peer chain gate untouched: only the designated upstream
-  // peer's events drive the model. The weighted multi-source logic applies
-  // only when A is the authority.
   receiveSound(t, amp, sourceId, distance, reach, isDownbeat){
-    // Both predictive (hasRhythm=true) and reactive (hasRhythm=false) agents
-    // pass through this function. They share the same source-distinguishing /
-    // weighing logic (per-source refractory, distance falloff, source-weight
-    // sliders, weighted multi-source gate, simultaneous-peer cluster collapse).
-    // The only difference is at the very END:
-    //   • predictive → feed event into the M4p model (which will generate
-    //                  predicted taps in the next tickStep).
-    //   • reactive   → enqueue an immediate tap (now + LATENCY_MOTOR) and
-    //                  update the lightweight IOI estimate. No prediction.
-    //
-    // The shared gating is essential for reactive agents: without it they
-    // would echo every peer broadcast they hear, and a fully-connected reactive
-    // cluster would compress all sound sources into one runaway feedback chain
-    // (each echo triggers another echo within 25–50 ms, faster every cycle).
-
-    // Effective period for refractory/window calculations — reactive agents use
-    // their own IOI estimate, predictive agents use the model's cycle_period.
     const effectivePeriod = this.hasRhythm ? this.model.cycle_period : this._reactiveCyclePeriod;
 
     // Per-source refractory: ignore if we received a beat from this same source
@@ -1699,11 +1440,7 @@ class Robot{
     const falloff = (reach > 0) ? Math.max(0, 1 - distance/reach) : 1;
     if(falloff <= 0) return; // out of range — no event delivered
 
-    // Source weight: prefer per-agent override snapshotted onto the bot at
-    // launch (this._srcW / this._peerW). Fall back to the live-panel slider so
-    // mid-run global slider changes still work for shared-weight runs. Use
-    // Number.isFinite so explicit 0 means "ignore" (the old `|| 1.0` trick
-    // silently rewrote 0 → 1).
+    // Source weight.
     const isFromA = (sourceId === 'A');
     let srcW;
     if(isFromA){
@@ -1721,44 +1458,26 @@ class Robot{
         srcW = Number.isFinite(v) ? v : 1.0;
       }
     }
-    if(srcW <= 0) return; // user has dialed this source to "ignore"
+    if(srcW <= 0) return;
 
     // Visual ripple — fire for any real event regardless of model gating, so the
-    // user can see that the agent IS receiving peer broadcasts even when those
-    // broadcasts don't drive the model.
+    // user can see that the agent IS receiving peer broadcasts.
     this.signalRipple = 1.0;
 
     // ── PRUNE STALE PEER-EVENT BUFFER ──
-    // Drop entries older than ~1.5 cycles. The buffer is small by construction
-    // (≤ 4 peers × a few beats), so a linear filter is fine.
     const PEER_BUF_HORIZON = effectivePeriod * 1.5;
     if(this._recentPeerEvents.length){
       this._recentPeerEvents = this._recentPeerEvents.filter(e => t - e.t < PEER_BUF_HORIZON);
     }
 
     // ── WEIGHTED MULTI-SOURCE GATE ──
-    // The constants below define the soft "hearing window" around each expected
-    // A-grid beat: tolerance ≈ 18% of A's period is wide enough to admit normal
-    // entrainment jitter (a well-locked agent's beat sits within a few percent
-    // of the grid) but tight enough to reject the ±0–40% phantom offsets the
-    // noise injection produces. PEER_BASE_WEIGHT (≤ 30% of A's weight) and
-    // PEER_FLOOR (sub-noise drop threshold) together keep peers as a social
-    // cross-check, never the dominant timing signal — even if the user dials
-    // the peer weight slider all the way up. The consensus boost is intentionally
-    // modest so that a single off-rhythm peer surrounded by entrained peers can't
-    // hijack the group: it has to actually fire near the same time as the others
-    // (not just at the same grid slot) to be reinforced.
-    const A_TOL_FRAC = 0.18;        // peer beat within ±18% of an A-grid slot ⇒ on-grid
-    const PEER_FLOOR = 0.15;        // skip model update if effective amp < this
-    const PEER_BASE_WEIGHT = 0.30;  // peers max ≤ ~30% of A's weight even at full agreement
+    const A_TOL_FRAC = 0.18;
+    const PEER_FLOOR = 0.15;
+    const PEER_BASE_WEIGHT = 0.30;
     const authId = this._authoritySourceId || 'A';
 
     // Source A path — always drives the model at full base weight.
     if(isFromA){
-      // Maintain the two most recent Source A event times so we can estimate
-      // A's local cycle period for the peer-conformity check below. Skip the
-      // update when the gap between events is implausible (cluster collapse,
-      // double-fire path) so the period estimate stays clean.
       const prev = this._lastSourceAEventT ?? -999;
       if(prev > 0){
         const gap = t - prev;
@@ -1768,80 +1487,45 @@ class Robot{
       }
       this._lastSourceAEventT = t;
     } else {
-      // Non-A event: bottleneck-mode chain authority is unchanged — only the
-      // designated upstream peer drives the model. Other peers ripple visually
-      // but do not feed process_event.
       if(authId !== 'A' && sourceId !== authId) return;
 
       // ── SIMULTANEOUS-PEER CLUSTER COLLAPSE ──
-      // Multiple peers firing the same beat within 50 ms (echo through
-      // alternative paths) collapse into one event so the model doesn't see
-      // a chord where it should see a single beat.
       const CLUSTER_WINDOW = 0.050; // 50 ms
       const lastAnyPeer = this._lastAnyPeerEventT ?? -999;
       if(t - lastAnyPeer < CLUSTER_WINDOW){
-        // Still record this peer in the consensus buffer (so it counts as a
-        // confirming voice for the very-recent beat) but don't double-update
-        // the model. The earlier-arriving peer of the cluster carried it.
         this._recentPeerEvents.push({sourceId, t});
         return;
       }
       this._lastAnyPeerEventT = t;
 
       // Record this peer event in the rolling consensus buffer BEFORE computing
-      // weights — it counts as one of the voices for any subsequent peer beat,
-      // and (harmlessly) as a self-vote for itself in the consensus check below.
+      // weights.
       this._recentPeerEvents.push({sourceId, t});
-
-      // Multi-source weighting only applies in open/orbit mode (authId === 'A').
-      // In bottleneck mode the chain authority is sole-driver by design.
       if(authId === 'A'){
         const aLast = this._lastSourceAEventT ?? -999;
         const A_REF_WINDOW = effectivePeriod * 2.0;
         const aFresh = (t - aLast) < A_REF_WINDOW && aLast > 0;
 
         if(aFresh){
-          // Estimate A's local period. Prefer the gap between the last two A
-          // events; fall back to the agent's effective period (model or
-          // reactive estimate) when only one A event has been heard.
+          // Estimate A's local period.
           let aPeriod = effectivePeriod;
           if(this._prevSourceAEventT > 0){
             const ap = this._lastSourceAEventT - this._prevSourceAEventT;
             if(IOI_MIN < ap && ap < IOI_MAX) aPeriod = ap;
           }
 
-          // Phase error to nearest A-grid beat. Project forward from aLast in
-          // increments of aPeriod and find the closest grid time to t.
+          // Phase error to nearest A-grid beat.
           const dtFromA = t - aLast;
           const k = Math.round(dtFromA / aPeriod);
           const expectedT = aLast + k * aPeriod;
           const phaseErr = Math.abs(t - expectedT); // seconds
           const phaseErrFrac = phaseErr / aPeriod;  // 0 = on grid, 0.5 = anti-grid
 
-          // Conformity to A's grid. Triangular window: 1 at zero error,
-          // linearly down to 0 at ±A_TOL_FRAC of the period.
+          // Conformity to A's grid.
           const conformity = Math.max(0, 1 - phaseErrFrac / A_TOL_FRAC);
 
-          // Peer-consensus boost. Look at OTHER peers' recent events within
-          // ±AGREE_WIN_FRAC of the period AROUND THE INCOMING BEAT'S TIME, not
-          // around an A-grid slot. The earlier (incorrect) version measured
-          // agreement against an A-grid slot, which meant correctly-entrained
-          // peers anywhere within ±half-period of the noisy beat counted as
-          // agreeing — even though they fired at the actual grid slot, not at
-          // the noisy beat's time. That falsely boosted any slightly-off-grid
-          // noisy beat by the rest of the group's correct beats.
-          //
-          // The correct check: a peer "agrees" with this beat only if it fired
-          // within AGREE_WIN_FRAC of the period of THIS event's time. Two
-          // beats at the same grid slot fired by different peers DO agree
-          // (small jitter ⇒ small temporal separation). A correctly-entrained
-          // peer's beat at grid slot N versus a noisy peer's beat 25%-off at
-          // slot N do NOT agree (they're temporally far apart).
-          const AGREE_WIN_FRAC = 0.07; // ±7% of period — tight enough that a beat
-                                       // a few percent off-grid does NOT pick up
-                                       // consensus from on-grid peers; loose enough
-                                       // for normal entrainment jitter to still
-                                       // count co-firing peers as agreeing.
+          // Peer-consensus boost.
+          const AGREE_WIN_FRAC = 0.07;
           const agreeWin = aPeriod * AGREE_WIN_FRAC;
           const agreeingIds = new Set();
           for(const e of this._recentPeerEvents){
@@ -1860,26 +1544,16 @@ class Robot{
             if(Math.abs(e.t - expE) > aPeriod * A_TOL_FRAC) continue;
             agreeingIds.add(e.sourceId);
           }
-          // Map agreement count to a small boost: 0 agreeing → 1.0 (neutral),
-          // 1 → 1.15, 2 → 1.3, 3 → 1.4 (capped). Modest by design: a chorus
-          // of agreeing peers reinforces a peer beat slightly, but never enough
-          // to surpass A's authority. The cap keeps PEER_BASE_WEIGHT dominant
-          // in the final amp expression below.
+          // Map agreement count to a small boost.
           const consensusBoost = Math.min(1.4, 1.0 + 0.15 * agreeingIds.size);
 
           // If conformity is essentially zero (off-grid phantom beat from a
-          // noisy peer) AND no other peers corroborate, drop entirely — the
-          // crowd hears it for what it is and doesn't follow.
+          // noisy peer) AND no other peers corroborate, drop entirely.
           //
           // REACTIVE EXCEPTION: When the user has explicitly set peer weight
           // higher than source-A weight (_peerW > _srcW), a reactive agent
           // should beep at positions its predictive peers are beeping even when
-          // source A is silent there (e.g. peer fires at 0.75 but A only fires
-          // at 0, 0.25, 0.5 — the peer beat has conformity=0 but should still
-          // drive the reactive follower). The A-conformity hard drop is a
-          // protection for the M4p predictive model; reactive agents have no
-          // model to protect, so we honour the user's explicit intent instead.
-          // Predictive agents (hasRhythm=true) keep the original strict gate.
+          // source A is silent there.
           const reactiveOverride = !this.hasRhythm && (() => {
             const pW = Number.isFinite(this._peerW) ? this._peerW
                      : (parseFloat(document.getElementById('live-peer-w')?.value) || 0);
@@ -1892,12 +1566,6 @@ class Robot{
           }
 
           // Stash the weight modifier for the amp computation below.
-          // For reactive agents whose peer weight exceeds source-A weight, use
-          // the peer-to-A weight ratio as the modulator instead of
-          // PEER_BASE_WEIGHT×conformity — this lets the off-grid peer beat
-          // scale proportionally to how strongly the user trusts peers over A.
-          // On-grid peer beats (conformity > 0) still use the conformity term
-          // for both agent types, keeping normal entrainment unaffected.
           if(!this.hasRhythm && reactiveOverride && conformity <= 0){
             const pW = Number.isFinite(this._peerW) ? this._peerW
                      : (parseFloat(document.getElementById('live-peer-w')?.value) || 0);
@@ -1910,37 +1578,24 @@ class Robot{
             this._peerWeightMod = PEER_BASE_WEIGHT * conformity * consensusBoost;
           }
         } else {
-          // No fresh A reference: peers drive the model unchanged (relay
-          // fallback). This preserves the original behavior when A is silent
-          // — bottleneck experiments and peer-only conditions keep working.
           this._peerWeightMod = 1.0;
         }
       } else {
-        // Bottleneck chain peer: pass through at full weight.
         this._peerWeightMod = 1.0;
       }
     }
 
     // Effective amplitude. Falloff scales linearly; source weight scales linearly.
-    // For peer events, _peerWeightMod (set by the multi-source gate above)
-    // attenuates the contribution by conformity-to-A × consensus boost so noisy
-    // outliers can't drag the model around. Source A events leave _peerWeightMod
-    // untouched and pass through at full base weight.
     const peerMod = isFromA ? 1.0 : (Number.isFinite(this._peerWeightMod) ? this._peerWeightMod : 1.0);
     let eff = amp * falloff * srcW * peerMod;
 
     // Sub-noise floor for peer events: if conformity × consensus shrinks the
-    // effective amplitude below PEER_FLOOR (0.15), drop the model update. The
-    // visual ripple already fired earlier so the user can still see the agent
-    // heard the peer; it just decided not to act on a clearly off-grid beat.
-    // Source A events are exempt — A always drives, even when faint.
+    // effective amplitude below PEER_FLOOR (0.15), drop the model update.
     //
     // REACTIVE EXCEPTION: When the user has set peer weight above source-A
     // weight, a reactive agent following off-grid peer beats will naturally
-    // have a lower computed eff (because _peerWeightMod ≤ 1.0). We scale the
-    // floor down by the same peer/A ratio so the floor doesn't silently
-    // veto what the user explicitly asked for. Predictive agents keep the
-    // original hard floor to protect the M4p model.
+    // have a lower computed eff (because _peerWeightMod ≤ 1.0).
+    // Predictive agents keep the original floor.
     let effectivePeerFloor = PEER_FLOOR;
     if(!isFromA && !this.hasRhythm){
       const pW = Number.isFinite(this._peerW) ? this._peerW
@@ -1951,11 +1606,7 @@ class Robot{
     }
     if(!isFromA && eff < effectivePeerFloor) return;
 
-    // Downbeat threshold preservation: only honored for Source A events. For
-    // peer events we DON'T promote a faint beat back up to 0.8, because doing
-    // so would let a low-conformity peer beat masquerade as a confident
-    // downbeat and undo the whole weighting. Peer downbeats still pass through
-    // when the agent is in genuine consensus (high conformity × consensus).
+    // Downbeat threshold preservation: only honored for Source A events.
     if(isFromA){
       if(isDownbeat && this.hasDownbeat && eff < 0.8) eff = 0.8;
       if(isDownbeat && !this.hasDownbeat && eff >= 0.8) eff = 0.75;
@@ -1963,30 +1614,13 @@ class Robot{
 
     // ── BRANCH: predictive vs reactive ──
     if(this.hasRhythm){
-      // Predictive: drive the M4p model. The model will emit predicted taps in
+      // Predictive: drive the model. The model will emit predicted taps in
       // its next tickStep — possibly anticipating beats that haven't arrived
       // yet (forward prediction).
       //
       // ── PREDICTIVE PEER-DRIVE RATE LIMIT (τ_min) ──
-      // Echo-cascade prophylaxis. Without this, a noisy agent's slightly-off
-      // broadcast slips through the conformity gate, nudges a neighbor's model
-      // forward, that neighbor broadcasts a slightly-earlier predicted beat,
-      // its neighbors' models advance further, and the group rhythm compresses
-      // into accelerating buzz — exactly the runaway pattern the reactive
-      // τ_min in §3.3.1 prevents at the output stage. The predictive analogue
-      // is to cap the rate at which PEER events feed process_event:
-      //
-      //     τ_min^peer = max(80 ms, α_rl · IBI_min)
-      //
-      // where IBI_min is the smallest inter-beat interval the rhythm can
-      // legitimately have (cycle_period / 4 — i.e., 16th-note grid in 4/4).
-      // α_rl = 0.40 matches the reactive-side rate-limit constant. Source A
-      // events are always exempt: A is the canonical timing reference and
-      // must always drive the model, even at high rates (e.g. dense patterns).
-      // Peer events that fall inside the refractory still produce visual
-      // ripples — they were already fired earlier in this function — so the
-      // user can see the agent IS hearing them; the model just declines to
-      // re-update so soon after the previous peer-driven update.
+      // Without this, a noisy agent's slightly-off broadcast slips through the
+      // conformity gate, the group rhythm compresses into accelerating buzz.
       if(!isFromA){
         const RL_FRAC = 0.40;
         const ibiMin = effectivePeriod * 0.25; // assume densest grid is 16ths in 4/4
@@ -1996,17 +1630,7 @@ class Robot{
       }
       this.model.process_event(t, eff);
     } else {
-      // Reactive: no prediction. Echo this accepted event as an immediate tap,
-      // delayed only by LATENCY_MOTOR (the same motor delay the predictive
-      // agents apply to their predicted taps). Update IOI estimate from
-      // observed authority-source intervals so orbit radius and visual phase
-      // stay sensible — but never use this estimate to schedule future taps.
-      //
-      // Track inter-beat IOI (every accepted beat, not just downbeats). This
-      // converges to cycle_period/N where N = beats per cycle. We use this
-      // intentionally: reactive agents step once per beat with a proportionally
-      // small step, so N small steps sum to the same arc-length per cycle as
-      // one large predictive step. See orbit locomotion section below.
+      // Reactive: no prediction.
       const isAuthority = isFromA || (authId !== 'A' && sourceId === authId);
       if(isAuthority && this._reactiveLastEventT > 0){
         const ioi = t - this._reactiveLastEventT;
@@ -2016,22 +1640,12 @@ class Robot{
       }
       if(isAuthority) this._reactiveLastEventT = t;
 
-      // Promote a downbeat tap when the upstream signaled one. For reactive
-      // agents we always honor the upstream isDownbeat flag for orbit-stepping
-      // and visual purposes — `hasDownbeat` only affects predictive agents'
-      // model-update branch (above) and is largely meaningless without a
-      // model. The audio loudness still differentiates: emitTap plays a
-      // louder tone for downbeats regardless.
+      // Promote a downbeat tap when the upstream signaled one.
       this._reactiveTaps.push({time: t + LATENCY_MOTOR, isDownbeat: !!isDownbeat});
     }
   }
   buildSnapshot(){
-    // Include ALL active grid ticks (including the downbeat at tk=0) so that
-    // snapshot comparison against the cipher offsets — which DO include the
-    // downbeat at phase 0 — can match correctly. The previous version excluded
-    // tk > 0.01, which meant a snapshot could never satisfy a cipher containing
-    // a downbeat target. Use a Set to deduplicate ticks shared across layers
-    // (e.g. both binary and ternary include 0.0).
+    // Include ALL active grid ticks (including the downbeat at tk=0).
     const snap = new Set();
     for(const[,l]of Object.entries(this.model.layers)){
       if(l.w > 0.4) for(const tk of l.ticks) snap.add(Math.round(tk*1e4)/1e4);
@@ -2040,17 +1654,6 @@ class Robot{
     this.snapAge = 0;
   }
   // Peer coupling — locomotion + snapshot propagation only.
-  //
-  // CRITICAL: This function NO LONGER injects phantom events into the model.
-  // The previous behavior (calling process_event with synthesized timestamps every
-  // frame for every neighbor) was the root cause of the "spurious beeping" runaway:
-  // each agent's M4p was being battered by ~240 phantom sub-beat events per second
-  // (60 frames × ~4 neighbors), which crashed the layer weights and constantly
-  // dragged the cycle-period anchor toward the noisiest peer's current internal
-  // phase. The model is event-driven (see Python M4_Grid.process_event); it should
-  // ONLY see real beats. Real peer beats now arrive as audio events via
-  // broadcastBeat() in tick(), tagged with the peer's pitch as sourceId so
-  // per-source refractory and source-weight gating apply correctly.
   coupleToBot(other, strength){
     if(!this.hasRhythm || !other.hasRhythm || other.conf < 0.2) return;
     let peerW;
@@ -2061,7 +1664,7 @@ class Robot{
     }
     const effStrength = strength * peerW;
 
-    // Locomotion alignment only — orient toward the partner's heading. This is a
+    // Locomotion alignment only. Orient toward the partner's heading. This is a
     // visual/spatial coupling, separate from rhythmic entrainment.
     if(other.conf > 0.4 && this.conf > 0.2){
       let da = other.angle - this.angle;
@@ -2070,27 +1673,15 @@ class Robot{
       this.angle += da * effStrength * 0.08;
     }
 
-    // Propagate the cipher snapshot (structural memory) so distant agents can
-    // continue generating during silence. This propagates the LEARNED pattern,
-    // not real-time anchor blending — it represents one agent telling another
-    // "this is what the pattern looks like" once. Snapshots only flow when the
-    // peer has built one and ours is missing or stale.
     if(other.cipherSnap.length > 0 &&
        (this.cipherSnap.length === 0 || other.snapAge < this.snapAge)){
       this.cipherSnap = [...other.cipherSnap];
       this.snapAge = other.snapAge + 1;
       this.relayFlash = 1.0;
-      // Also seed the M4p structural_memory directly so generation continues
-      // during silence (matches Python's structural_memory pathway). This is a
-      // ONE-TIME copy when we receive a snap, NOT a per-frame mutation.
       if(this.model.structural_memory === null && other.model.structural_memory !== null){
         this.model.structural_memory = other.model.structural_memory.map(ls => ({
           ticks: [...ls.ticks], res: ls.res
         }));
-        // Also seed cycle period and anchor ONCE so the freshly-seeded memory
-        // generates aligned beats. This is a one-shot initialization, not a
-        // continuous blend, so it doesn't create the runaway feedback the old
-        // every-frame anchor blend caused.
         this.model.cycle_period = other.model.cycle_period;
         this.model.last_onset_time = other.model.last_onset_time;
       }
@@ -2099,13 +1690,6 @@ class Robot{
 
   // Broadcast a beat this agent just emitted to peers.
   //   Open/orbit mode: broadcast to all peers within hearingR.
-  //   Bottleneck mode: broadcast to immediate chain neighbors ONLY (id-1 and id+1),
-  //     subject to hearingR. This implements the user-intended chain topology
-  //     (B1↔B2↔B3↔B4↔B5) where rhythm propagates one link at a time.
-  // Each receiving peer treats it as a real audio event with proper timing,
-  // amplitude (downbeat vs sub-beat), and source identity (this agent's pitch
-  // string, so the peer's per-source refractory and weight gating apply).
-  // Called from the tap loop in tick() — once per real emitted beat.
   broadcastBeat(beatTime, isDownbeat, allBots, hearingR, envMode){
     const amp = isDownbeat ? 1.0 : 0.6;
     const sourceId = `peer:${this.id}`;
@@ -2121,7 +1705,7 @@ class Robot{
       listeners = allBots.filter(p => p !== this);
     }
     for(const peer of listeners){
-      // Reactive peers (hasRhythm=false) must also receive broadcasts — they
+      // Reactive peers (hasRhythm=false) must also receive broadcasts, they
       // beep immediately on accepted incoming events. Skip only if peer is
       // missing entirely. The receiveSound() function handles the predictive
       // vs reactive branching internally, applying identical source-weighing
@@ -2136,17 +1720,10 @@ class Robot{
 
   tick(t,allBots,gcfg,tactic,emitter,envMode){
     const effCoupling=gcfg.coupling,neighborR=gcfg.neighborR;
-    // Noisy-agent phantom event injection. gcfg.noiseRate is the direct per-frame
-    // probability — not a multiplier. Capped at 0.07 by the setup slider so the
-    // noisy agent's own model still has time to re-converge between glitches and
-    // doesn't permanently lose entrainment. A typical sane range is 0.01–0.05.
-    //
+    // Noisy-agent phantom event injection.
     // ── INITIATION NOISE GATE ──
     // Suppress noise for the first cycle period after launch so that Source A
     // can fire at least one full round of beats before any phantom events appear.
-    // This gives every agent one clean reference cycle to anchor the downbeat
-    // before the noisy agent starts perturbing the group. Noise runs freely from
-    // t = launchT + cyclePeriod onward, so group-resilience testing is unaffected.
     const noiseRate = (typeof gcfg.noiseRate === 'number') ? gcfg.noiseRate : 0.035;
     const _cyclePeriod = this.hasRhythm ? this.model.cycle_period : (this._reactiveCyclePeriod || 2.0);
     const _launchT = (typeof EPOCH_LAUNCH_T !== 'undefined' && EPOCH_LAUNCH_T > 0) ? EPOCH_LAUNCH_T : 0;
@@ -2157,8 +1734,6 @@ class Robot{
           const fakeT=t+(Math.random()-.5)*this.model.cycle_period*0.8;
           this.model.process_event(fakeT,0.85);this.cipherSnap=[];
         } else {
-          // Reactive noisy: inject a spurious echo tap directly. No model to
-          // disturb; the noise just shows up as an off-beat reactive emission.
           const fakeT=t+(Math.random()-.5)*this._reactiveCyclePeriod*0.8;
           this._reactiveTaps.push({time: Math.max(t, fakeT)+LATENCY_MOTOR, isDownbeat: false});
         }
@@ -2166,11 +1741,6 @@ class Robot{
     }
 
     // ── Bottleneck mode: all agents stationary at fixed posts ──
-    // Per user-intended design: every agent is "active" from launch and stays at
-    // its post for the entire run. Rhythm propagation is achieved entirely via
-    // chain-restricted hearing (Source A → B1 only; broadcastBeat between id±1
-    // only — see broadcastBeat()). No marching, no activation gating, no relay
-    // state machine. The chain topology IS the bottleneck.
     if(envMode==='bottleneck'){
       this.speed=0;
       this.bnActive=true;     // legacy flag, kept for any UI code that reads it
@@ -2207,12 +1777,6 @@ class Robot{
     }
 
     // ── EMISSION PIPELINE (shared) ──
-    // Process one emitted tap exactly the same way regardless of whether it
-    // came from the M4p predictive model or from a reactive echo. This makes
-    // reactive agents indistinguishable from predictive agents in their
-    // outward behaviour (audio, visual flash, peer broadcast, beat log,
-    // emitted-phase record). The ONLY difference is upstream: where the tap
-    // came from (model.tickStep vs immediate echo of accepted incoming sound).
     const emitTap = (tap, periodForPhase, anchorForPhase) => {
       if(tap.isDownbeat){
         playTone(this.pitch, 0.8, true);
@@ -2225,16 +1789,6 @@ class Robot{
         this.broadcastBeat(tap.time, tap.isDownbeat, allBots, neighborR, envMode);
       }
       // Record the actual emitted beat phase for the lock evaluation.
-      // Two phase reference frames:
-      //   phase     — agent's own frame (relative to anchor & period). Useful
-      //               for confidence/conf measurements.
-      //   phaseA    — source-A frame (relative to emitter.lastCycleT and
-      //               emitter.repeatPeriod). Used for cipher matching, because
-      //               the cipher itself is defined in source-A's reference frame.
-      //               If the agent is out of sync with source A (e.g., still
-      //               emitting at old tempo after tempo switch), phaseA exposes
-      //               that — agent-frame phase wouldn't, since the agent's
-      //               internal frame moves with its own anchor.
       if(anchorForPhase>0 && periodForPhase>0.01){
         const ph=((tap.time - anchorForPhase) % periodForPhase) / periodForPhase;
         const phWrapped=((ph%1)+1)%1;
@@ -2273,21 +1827,12 @@ class Robot{
         this.dbFlash=Math.max(this.dbFlash,this.model._dbFlash);
         this.model._dbFlash=Math.max(0,this.model._dbFlash-0.06);
       }
-      // Audio + sub-beat colored flash + peer broadcast: drive from the taps
-      // the model just emitted (one entry per beat with isDownbeat flag).
-      // Each emitted tap → one tone, one flash, AND one real audio event sent
-      // to every peer in hearing range. This is how agents hear each other:
-      // real beats at real times, NOT phantom every-frame coupling injections.
       for(const tap of taps){
         emitTap(tap, this.model.cycle_period, this.model.last_onset_time);
       }
       this.phase=this.model.phase;this.conf=this.model.confidence;
     } else {
       // ── REACTIVE BRANCH ──
-      // No internal predictor. Drain the queue of pending taps that were
-      // scheduled by receiveSound() (each accepted incoming event scheduled
-      // one tap at receive_time + LATENCY_MOTOR). Fire any whose scheduled
-      // time has arrived; keep the rest for next frame.
       const pending=[];
       const fire=[];
       for(const tap of this._reactiveTaps){
@@ -2296,16 +1841,6 @@ class Robot{
       }
       this._reactiveTaps=pending;
 
-      // Sort by time and apply a 50 ms refractory across frames so the same
-      // beat can't double-fire (mirrors the predictive branch's tap dedup).
-      // Also enforce a minimum inter-tap interval tied to the agent's own IOI
-      // estimate — this caps the echo-runaway that occurs during perturbation
-      // when reactive agents loop each other's spurious sounds into an
-      // accelerating feedback chain. The naturalistic phenomenon is preserved
-      // (reactive groups ARE more fragile during perturbation), but the rate
-      // is bounded so it doesn't crash the simulation into incoherent buzzing.
-      // Floor: reactive agents cannot fire faster than ~40% of their estimated
-      // cycle period, regardless of how fast they're receiving peer broadcasts.
       fire.sort((a,b)=>a.time-b.time);
       const REACT_REFRACTORY=0.050;
       const _rlFrac = parseFloat(document.getElementById('live-react-rl')?.value) || 0.40;
@@ -2315,31 +1850,13 @@ class Robot{
         if(tap.time - this._reactiveLastTapT < REACT_MIN_INTERVAL) continue;
         this._reactiveLastTapT = tap.time;
         if(tap.isDownbeat){
-          // Reactive agents do NOT have an internal grasp of downbeat — they
-          // only echo what they hear. The upstream isDownbeat flag is used
-          // strictly to drive the orbit-step trigger (so reactive agents move
-          // around the formation in step with the cycle), but we deliberately
-          // do NOT set this.dbFlash here. Reactive agents must pulse the same
-          // way at every beat (visually) — uniform colored ring, no white
-          // downbeat ring, no white outline boost — because they cannot
-          // distinguish a downbeat from a sub-beat as a category.
+          // Reactive agents do NOT have an internal grasp of downbeat, they
+          // only echo what they hear.
           this.model._predictedDownbeatT=tap.time;
         }
-        // Force the colored sub-beat flash on every reactive tap regardless
-        // of upstream downbeat flag. emitTap() only sets tapFlash on
-        // non-downbeats (because the predictive branch uses dbFlash for
-        // downbeats). For reactive agents we override that here so every tap
-        // produces an identical visual pulse.
         this.tapFlash=1.0;
         emitTap(tap, this._reactiveCyclePeriod, this._reactiveLastEventT);
       }
-
-      // Visual phase + confidence for reactive agents. Use the lightweight
-      // IOI estimate updated in receiveSound. Confidence is binary-ish: rises
-      // toward ~0.5 once a few authority events have been heard, drops to 0
-      // if we've heard nothing in the last ~3 cycles. This keeps orbit
-      // direction-consensus and contact-push code paths working for reactive
-      // agents (they participate in the formation just like predictive ones).
       const period=Math.max(0.1, this._reactiveCyclePeriod);
       if(this._reactiveLastEventT>0){
         const since=t-this._reactiveLastEventT;
@@ -2358,30 +1875,10 @@ class Robot{
     }
 
     // ── Locomotion ──
-    // Bottleneck mode: agents stay at posts (handled at top of tick); skip locomotion.
-    // Orbit mode: discrete stepping.
-    //   Predictive agents: one large step per downbeat (full cycle step size).
-    //   Reactive agents:   one small step per emitted beat. Since _reactiveCyclePeriod
-    //     tracks the inter-beat IOI (≈ cycle_period/N for an N-beat cipher), the per-beat
-    //     step arc is scaled by IOI/period so N small steps sum to the same arc-length
-    //     per cycle as one predictive stride. Both agent types use the same fixed orbit radius.
     if(envMode!=='bottleneck') {
       // ── ORBIT MODE locomotion ──
-      // Orbit radius is fixed to canvas geometry (orbitBaseR) — it must NOT scale
-      // with cycle period. A longer period just means steps happen less often (one
-      // per downbeat), not that the orbit circle grows. Period-scaling caused the
-      // radius to balloon to off-screen distances at tempos > 2 s/cycle.
       const baseR = gcfg.orbitBaseR || 100;
       this.orbitRadius = baseR;
-
-      // Step size: fixed canvas-relative arc length so the visual orbit speed
-      // looks the same regardless of tempo. One step per downbeat at any period.
-      // 36 px arc ≈ one step at default 2 s/cycle with orbitBaseR≈168 px gives
-      // ~29 cycles per full revolution — a comfortable visual.
-      // Reactive agents step on every beat (N steps/cycle), so their per-beat arc
-      // is smaller: stepSize / N steps = same total arc per cycle as predictive.
-      // We don't know N, but reactive _reactiveCyclePeriod ≈ IOI ≈ period/N, so
-      // scaling step by the reactive/predictive ratio keeps arc-per-cycle equal.
       const STEP_ARC = 36; // px — fixed, canvas-relative
 
       // ── Step trigger ──
@@ -2396,9 +1893,7 @@ class Robot{
           }
         }
       } else {
-        // Reactive: step on every emitted tap. _reactiveLastTapT is updated in
-        // the emission loop above each time a tap actually fires. Track it here
-        // by comparing to our own stored value so we only step once per new tap.
+        // Reactive: step on every emitted tap.
         if(this.conf>0.10 && this._reactiveLastTapT > this._lastOrbitStepT){
           beatFired=true;
           this._lastOrbitStepT=this._reactiveLastTapT;
@@ -2407,10 +1902,6 @@ class Robot{
       this._lastBeatPhase=this.phase;
 
       if(beatFired){
-        // For reactive agents, scale step proportionally to their inter-beat IOI
-        // so N small steps sum to the same arc as one predictive stride.
-        // INIT_CYCLE_PERIOD is the configured full-cycle duration; _reactiveCyclePeriod
-        // is the inter-beat IOI. Their ratio ≈ 1/N (beats per cycle).
         const stepSize = this.hasRhythm
           ? STEP_ARC
           : Math.max(4, STEP_ARC * (Math.max(0.05, this._reactiveCyclePeriod) / Math.max(0.05, INIT_CYCLE_PERIOD)));
@@ -2418,9 +1909,6 @@ class Robot{
         this.orbitAngle+=dAng;
       }
 
-      // Move toward the orbit target. Use a high pull speed so the agent reads as
-      // *snapping* to the new orbit slot at the downbeat, then sitting still until
-      // the next one — discrete steps, not continuous gliding.
       const cx=gcfg._emitterPos?gcfg._emitterPos.x:gcfg.W/2;
       const cy=gcfg._emitterPos?gcfg._emitterPos.y:gcfg.H/2;
       const targetX=cx+Math.cos(this.orbitAngle)*this.orbitRadius;
@@ -2428,19 +1916,14 @@ class Robot{
       const dxT=targetX-this.x,dyT=targetY-this.y;
       const distT=Math.sqrt(dxT*dxT+dyT*dyT);
       if(distT<2){
-        // At target — stay put until next beat (zero speed).
         this.speed=0;
       } else {
-        // Snap-pull: move at high speed toward target and arrive within ~80–120ms.
-        // pullSpeed scales with remaining distance so it slows as it arrives.
         this.speed=Math.min(800,distT*12+40);
         this.angle=Math.atan2(dyT,dxT);
       }
     }
 
     // ── Social coupling: peer-to-peer ──
-    // Only couple if this agent already has a source-verified snapshot (snapAge < 5s means fresh)
-    // This prevents false peer-entrainment before any agent has heard the source
     const hasVerifiedSnap=this.cipherSnap.length>0&&this.snapAge<6.0;
     const neighbors=allBots.filter(nb=>{
       if(nb===this)return false;
@@ -2454,7 +1937,6 @@ class Robot{
     });
     if(this.hasSocial&&neighbors.length>0){
       for(const nb of neighbors){
-        // Receive from neighbor only if neighbor has a verified snap
         if(nb.conf>0.25&&nb.cipherSnap.length>0&&nb.snapAge<6.0)
           this.coupleToBot(nb,effCoupling);
       }
@@ -2480,14 +1962,10 @@ class Robot{
       }
     }
 
-    // Open mode post-zone steering: only pull back if entrained (unentrained are already drifting toward A)
     if(envMode!=='bottleneck'&&this.conf>0.3){
       // CONTACT: if another agent is close, exchange orbit direction (the
       // higher-confidence agent's direction wins). Agents pass THROUGH each
-      // other physically — no positional push — so a desynced or noisy agent
-      // orbiting at an off cadence doesn't get visibly jolted off its ring
-      // every time another agent drifts past. The contact flash still fires
-      // so the user can see the negotiation; only the angular shove is gone.
+      // other physically.
       for(const nb of allBots){
         if(nb===this)continue;
         const dxC=nb.x-this.x,dyC=nb.y-this.y;
@@ -2527,7 +2005,7 @@ class Robot{
     const x=this.x,y=this.y;
     const frozen=!this.bnActive;
     const BOD=15; // body radius (up from 11)
-    // Hearing range dashed ring — shows each agent's social coupling radius
+    // Hearing range dashed ring shows each agent's social coupling radius
     // Rendered in blue so it's visually distinct from the agent color/pulses.
     // Brightens while the hearing-range slider is being dragged.
     const hearR=(this.gcfg.neighborR||150);
@@ -2613,9 +2091,6 @@ class Robot{
       ctx.fillText(`${this.pitch}Hz`,x,y+17);
     }
     // Orbit direction indicator in open/orbit mode.
-    // Predictive agents (hasRhythm=true): a more prominent arrow that clearly
-    // points in the direction of travel (tangent of the orbit in orbitDir).
-    // Reactive agents: a small dim chevron — they follow, not lead.
     if(!frozen&&this.conf>0.1){
       const travelAng=this.orbitAngle+this.orbitDir*Math.PI/2; // tangent = direction of movement
       if(this.hasRhythm){
@@ -2698,7 +2173,6 @@ class Emitter{
             playTone(PITCH_FREQS.sourceA, 0.4, false);  // sub-beat: softer
           }
         } else {
-          // Beat was dropped by miss-rate filter — trigger visual drop indicator
           this.dropFlash=1.0;
           this._droppedBeats++;
         }
@@ -2709,13 +2183,13 @@ class Emitter{
   }
   draw(ctx,showSignal,beatCount){
     const{x,y}=this;
-    // Source A reach radius — dotted amber circle so it's clear which agents can hear A
+    // Source A reach radius, dotted amber circle so it's clear which agents can hear A
     if(SOURCE_A_REACH>0){
       ctx.beginPath();ctx.arc(x,y,SOURCE_A_REACH,0,Math.PI*2);
       ctx.strokeStyle='rgba(240,176,74,0.35)';ctx.lineWidth=1.5;
       ctx.setLineDash([5,4]);ctx.stroke();ctx.setLineDash([]);
     }
-    // Static ambient rings (very faint)
+    // Static ambient rings
     for(let ring=0;ring<3;ring++){
       ctx.beginPath();ctx.arc(x,y,18+ring*14,0,Math.PI*2);
       ctx.strokeStyle=`rgba(240,176,74,${0.08-ring*0.02})`;ctx.lineWidth=1;ctx.stroke();
@@ -2795,34 +2269,18 @@ class Lock{
     this.matched=0;this.unlocked=false;this.unlockFlash=0;this.totalUnlocks=0;
     this.launchT=-1;this.firstUnlockT=-1;this.lastUnlockT=-1;this.unlockHistory=[];
     // Min cycles of evidence required before any unlock can fire.
-    // Prevents instant pattern-match from the model's default grid before
-    // the agent has actually demonstrated the rhythm by emitting beats.
-    // We measure observability as a count of emitted beats, not as cycles since
-    // last_onset_time, because last_onset_time gets reset on every source A
-    // downbeat — so cycles-since-anchor never grows past ~1, and the metric
-    // would reject all matches forever once a stable lock was achieved.
     this.minBeatsForUnlock=4;
   }
   // Evaluate based on the agent's RECENT EMITTED BEAT PHASES, not its internal grid template.
-  // - emittedPhases: Array<{phase: 0..1, t: seconds, isDownbeat: bool}>
-  // - cyclePeriod: (kept for compat; unused since beat-count gating)
-  // - lastOnsetTime: (kept for compat; unused since beat-count gating)
-  // - currentT: (kept for compat; unused since beat-count gating)
   evaluate(emittedPhases, cyclePeriod, lastOnsetTime, currentT){
     if(!emittedPhases || emittedPhases.length===0 || this.cipher.length===0){
       this.matched=0; this.unlocked=false; return;
     }
-    // Require minimum beat count before we can report an unlock. This is the
-    // observability gate — the agent must have actually emitted enough beats
-    // for us to assess whether its emission pattern matches the cipher.
     if(emittedPhases.length < this.minBeatsForUnlock){
       this.matched=0; this.unlocked=false; return;
     }
     // For each cipher target phase, check that at least one recently emitted beat
     // landed within tolerance (in circular phase distance).
-    // Use source-A reference phase (phaseA) — the cipher is defined in source-A's
-    // frame, so an agent emitting at the wrong tempo will fail to match here even
-    // if its own-frame phase looks fine.
     let m=0;
     for(const target of this.cipher){
       const hit = emittedPhases.some(b => {
@@ -2908,11 +2366,6 @@ let PARAM_SNAPSHOT_ROWS=[];
 // each row = {t_elapsed_s, parameter, old_value, new_value}
 let PARAM_CHANGES=[];
 // Append-only log of every beat emitted by Source A or any agent during the run.
-// Each row = {t_elapsed_s, source, is_downbeat, epoch}
-//   source = 'A' for Source A; 'B0'..'B4' for agents B1..B5
-//   is_downbeat = 1 (downbeat) or 0 (sub-beat)
-//   epoch = current EPOCH_STATE label so beats can be grouped by phase
-// Used to verify per-agent timing differences and diagnose model output.
 let BEAT_LOG_ROWS=[];
 const SAMPLE_RATE=0.2;
 
@@ -3086,9 +2539,7 @@ function bindSlider(id,vid,dp,fmt){
   el.addEventListener('input',upd);upd();
 }
 bindSlider('s-baseline','s-baseline-v',0);
-// Shock + Recovery duration sliders live on the Perturbation tab. The hidden
-// inputs s-shock-dur and s-recovery are kept for backward compatibility with
-// any code that reads them — they're synced from the visible sliders here.
+// Shock + Recovery duration sliders live on the Perturbation tab.
 bindSlider('s-shock-dur-pert','s-shock-dur-pert-v',0);
 bindSlider('s-recovery-pert','s-recovery-pert-v',0);
 {
@@ -3161,11 +2612,8 @@ function buildAgentWeightsTable(){
   function updateState(){
     PER_AGENT_WEIGHTS_ENABLED=cb.checked;
     if(cb.checked){
-      // Seed per-agent values from the current shared sliders the first time we expand
       const sharedSrcV=parseFloat(sharedSrc.value)||1.0;
       const sharedPeerV=parseFloat(sharedPeer.value)||0.05;
-      // Only seed if AGENT_WEIGHTS still holds the init defaults (srcW=1.0,
-      // peerW=0.05 for every agent); otherwise preserve user-edited values.
       const allDefault=AGENT_WEIGHTS.every(w=>w.srcW===1.0&&w.peerW===0.05);
       if(allDefault){
         for(let i=0;i<5;i++){AGENT_WEIGHTS[i]={srcW:sharedSrcV,peerW:sharedPeerV};}
@@ -3184,7 +2632,7 @@ function buildAgentWeightsTable(){
   updateState();
 }
 
-// Period slider — directly sets cycle duration, updates s-rep hidden and beat display
+// Period slider directly sets cycle duration, updates s-rep hidden and beat display
 {
   const periodEl=document.getElementById('s-bpm'); // reuses same element id
   const periodVEl=document.getElementById('s-bpm-v');
@@ -3214,9 +2662,6 @@ function buildAgentWeightsTable(){
 }
 
 // ── Live parameter-change logging ──────────────────────────
-// Called on slider 'change' (when user releases), not on every 'input' event,
-// so dragging produces ONE log entry per gesture, not hundreds. Only logs
-// while a run is active, so pre-launch tweaks aren't recorded.
 const _paramLastLogged={}; // parameter → last logged value (string)
 function logParamChange(parameter, newValue){
   if(!RUNNING || PAUSED) return;
@@ -3283,10 +2728,6 @@ let _hearingSliderActiveUntil = 0; // wall-clock seconds; rings brighten while d
     swEl.addEventListener('input',()=>{
       const v=parseFloat(swEl.value).toFixed(2);
       if(swVEl)swVEl.textContent=v;
-      // If the user moves the global slider mid-run while per-agent weights
-      // were active at launch, drop the per-agent override on all bots so the
-      // global slider takes effect immediately. The setup-time AGENT_WEIGHTS
-      // are unchanged so a re-launch still uses them.
       if(SIM && SIM.robots){
         for(const r of SIM.robots) r._srcW = undefined;
       }
@@ -3312,10 +2753,6 @@ let _hearingSliderActiveUntil = 0; // wall-clock seconds; rings brighten while d
 }
 
 // Live reactive echo rate limit removed from UI; hidden input #live-react-rl
-// keeps its default value (0.40) so the backend rate-limit logic remains active.
-
-// bindSlider('s-noise-amp','s-noise-amp-v',1); // removed: agent noise removed
-// Tempo switch sliders removed (tempo switch is under development)
 bindSlider('sw-pa-dur','sw-pa-dur-v',0,v=>`${v}s`);
 bindSlider('sw-pb-dur','sw-pb-dur-v',0,v=>`${v}s`);
 bindSlider('sw-pr-dur','sw-pr-dur-v',0,v=>`${v}s`);
@@ -3412,8 +2849,7 @@ function buildSim(W,H){
   const neighborR=parseFloat(document.getElementById('live-nr')?.value||'200')||200;
   const coupling=parseFloat(document.getElementById('s-cpl').value)||0.5;
   // Noise rate = direct per-frame probability that a noisy agent injects a
-  // phantom event. Setup slider clamps this to [0.001, 0.07] so a user can't
-  // accidentally crank it past the "agent recovers" regime.
+  // phantom event. Setup slider clamps this to [0.001, 0.07].
   const rawNoise=parseFloat(document.getElementById('s-noise')?.value);
   const noiseRate=Math.min(0.07, Math.max(0.001, Number.isFinite(rawNoise)?rawNoise:0.035));
   const repPeriod=parseFloat(document.getElementById('s-rep').value)||2.0;
@@ -3422,11 +2858,10 @@ function buildSim(W,H){
   const cx=W/2,cy=H/2;
   const emX=cx,emY=cy;   // source A at canvas center
 
-  // Lock C placed off to the side (kept for metrics UI, not used for orbit scoring)
+  // Lock C placed off to the side.
   const lkX=W-Math.round(W*0.08),lkY=cy;
 
-  // Orbit base radius — comfortable fraction of canvas, independent of hearing range
-  // so the slider max can be set to cover all agents
+  // Orbit base radius.
   const orbitBaseR=Math.min(W,H)*0.28;
 
   const gcfg={guardR,neighborR,coupling,noiseRate,speedMult:1.0,W,H,
@@ -3462,10 +2897,6 @@ function buildSim(W,H){
     const ov=AGENT_OVERRIDES[i];
     const caps=ov?{...baseCaps,...ov}:baseCaps;
     const r=new Robot(i,p.x,p.y,guardR,caps,gcfg);
-    // Bottleneck mode: all agents stationary at posts from launch — no marching,
-    // no activation gating, no relay state machine. Chain topology is enforced
-    // entirely by chain-restricted hearing in broadcastBeat() and source-A
-    // reception (only B1 hears source A).
     if(ENV_MODE==='bottleneck'){
       r.bnActive=true;r.bnArrived=true;
       // Chain authority: B1 → 'A' (source); B2 → 'peer:0' (B1); B3 → 'peer:1'; etc.
@@ -3473,21 +2904,16 @@ function buildSim(W,H){
     }
     else{
       r.bnActive=true;r.bnArrived=false;
-      // Open/orbit mode: every agent treats Source A as the canonical authority.
       r._authoritySourceId = 'A';
     }
     // Set initial orbit angle for orbit mode
     if(ENV_MODE!=='bottleneck'){
       r.orbitAngle=p.orbitAngle;
       // All agents start in the same direction (CCW = +1) so they never run
-      // into each other on launch. Direction consensus can still evolve later
-      // if a noisy agent or contact negotiation shifts the majority.
+      // into each other on launch.
       r.orbitDir=1;
     }
-    // Per-agent weights — when enabled, snapshot AGENT_WEIGHTS[i] onto the bot
-    // so receiveSound() reads from there instead of the live-panel slider. When
-    // disabled, leave _srcW/_peerW undefined so receiveSound falls through to
-    // the shared live slider (mid-run global tuning still works).
+    // Per-agent weights.
     if(PER_AGENT_WEIGHTS_ENABLED){
       r._srcW = AGENT_WEIGHTS[i].srcW;
       r._peerW = AGENT_WEIGHTS[i].peerW;
@@ -3513,11 +2939,6 @@ function launchSim(){
   // Period slider (s-bpm is now the period-length slider, value in seconds)
   const period=parseFloat(document.getElementById('s-bpm').value)||2.0;
   document.getElementById('s-rep').value=period.toFixed(3);
-  // Seed INIT_CYCLE_PERIOD so Robot constructors (and their M4p models) start at
-  // the user-configured cycle duration, not the hardcoded 2.0 default. Without this,
-  // a model initialized at 2.0 s confronts the first downbeat-to-downbeat IOI of
-  // (say) 4.0 s, computes ratio=2.0, and the isMissedBeat guard suppresses the
-  // drastic update — leaving the model stuck at 2.0 s for the entire run.
   INIT_CYCLE_PERIOD = period;
   EPOCH_CFG.baseline=parseFloat(document.getElementById('s-baseline').value)||30;
   EPOCH_CFG.shockDur=parseFloat(document.getElementById('s-shock-dur').value)||15;
@@ -3525,12 +2946,6 @@ function launchSim(){
   PERT_MISS_RATE=parseFloat(document.getElementById('s-miss-rate').value)/100||0;
 
   // Propagate setup-page initial values to the live sliders in the run panel.
-  // The live sliders are the source of truth during a run; the setup values are
-  // just the *starting position*. Users can still tune these live mid-experiment.
-  //
-  // When per-agent weights are enabled, the live sliders don't drive anything
-  // (each bot reads its own snapshotted _srcW/_peerW), so disable them and show
-  // a note explaining why.
   const livePanelEl=document.getElementById('live-coupling-panel');
   const liveLockedNoteEl=document.getElementById('live-coupling-locked-note');
   const liveSrcWEl=document.getElementById('live-src-w');
@@ -3543,8 +2958,6 @@ function launchSim(){
     if(livePeerWEl){livePeerWEl.disabled=true;}
     if(livePanelEl){livePanelEl.style.opacity='0.5';}
     if(liveLockedNoteEl){liveLockedNoteEl.style.display='block';}
-    // Display the *average* of per-agent values so the readouts aren't stuck on a
-    // misleading default. Purely cosmetic — these sliders are inert this run.
     let sumSrc=0,sumPeer=0;
     for(let i=0;i<5;i++){sumSrc+=AGENT_WEIGHTS[i].srcW;sumPeer+=AGENT_WEIGHTS[i].peerW;}
     const avgSrc=sumSrc/5,avgPeer=sumPeer/5;
@@ -3553,7 +2966,6 @@ function launchSim(){
     if(livePeerWEl)livePeerWEl.value=avgPeer;
     if(livePeerWVEl)livePeerWVEl.textContent=avgPeer.toFixed(2);
   } else {
-    // Re-enable in case a previous run had the lock on.
     if(liveSrcWEl){liveSrcWEl.disabled=false;}
     if(livePeerWEl){livePeerWEl.disabled=false;}
     if(livePanelEl){livePanelEl.style.opacity='1';}
@@ -3597,17 +3009,7 @@ function launchSim(){
   _snap('peer_agent_weight_initial', document.getElementById('s-peer-w')?.value||'', 'multiplier');
   _snap('per_agent_weights_enabled', PER_AGENT_WEIGHTS_ENABLED ? 'true' : 'false');
   // Per-agent setup snapshot. We ALWAYS write one row per agent for every
-  // tunable per-agent parameter — Source A weight, Peer (coupling) weight,
-  // prediction model, and noisy flag — regardless of whether the per-agent
-  // toggle is on. When the toggle is off, each agent gets the shared value;
-  // when it is on, each agent's individually-tuned value is recorded. This
-  // makes the params CSV self-documenting: the user can always find the
-  // exact weights/model/noise flag each agent ran with in one place.
-  //
-  // Ground truth: read from SIM.robots[i] where possible, since the actual
-  // simulation already resolved overrides against composition defaults at
-  // launch (see buildSim). Falls back to the shared sliders if the bot
-  // didn't have a per-agent override (in which case all 5 share that value).
+  // tunable per-agent parameter.
   const _sharedSrcW = parseFloat(document.getElementById('s-src-w')?.value);
   const _sharedPeerW = parseFloat(document.getElementById('s-peer-w')?.value);
   for(let i=0;i<5;i++){
@@ -3642,7 +3044,7 @@ function launchSim(){
     tGroupSync:-1,accuracyAtSync:0,
     agentFirstSync:[-1,-1,-1,-1,-1],
     // Corruption type per agent at shock onset:
-    //   null              — never corrupted (was already wrong, or stayed correct)
+    //   null              — never corrupted.
     //   'pattern_sub'     — emitted beats match a different rhythm structure
     //                       (model still confident, but locked to wrong phase positions)
     //   'sync_loss'       — model lost confidence/entrainment (no stable rhythm)
@@ -3650,20 +3052,20 @@ function launchSim(){
     agentCorruptType:[null,null,null,null,null],
     // Per-agent state at shock onset (snapshot: was this agent correct when shock began?)
     agentCorrectAtShock:[false,false,false,false,false],
-    // Per-agent: full T_rec — time from shock onset to re-sync (only set if was corrupted)
+    // Per-agent: full T_rec, time from shock onset to re-sync (only set if was corrupted)
     agentRecoverT:[-1,-1,-1,-1,-1],
     // Group-level recovery time: time from shock onset until ALL active agents are
     // correctly synchronized again (after at least one had been corrupted).
     tFullRecovery:-1,
-    // Retention rate at end of shock — proportion of agents still correctly synced
+    // Retention rate at end of shock, proportion of agents still correctly synced
     retentionRate:-1,
-    // Recovery rate — proportion of corrupted agents that re-synced before run end
+    // Recovery rate, proportion of corrupted agents that re-synced before run end
     recoveryRate:-1,
     // ─── Perturbation-phase metrics (during phase B / shock) ───
     // Each agent's relock time within phase B (i.e., did they figure out the new
     // pattern WHILE perturbation was active, before recovery began?). -1 = never
     // relocked during phase B. For tempo/pattern switch, this measures adaptation
-    // to the NEW cipher; for shock, it's largely vacuous (cipher unchanged).
+    // to the NEW cipher.
     agentPerturbationRelock:[-1,-1,-1,-1,-1],
     // Group adaptation: time within phase B until ALL agents' emissions match the
     // perturbation-phase cipher (for switches; this is meaningless for shock).
@@ -3676,7 +3078,7 @@ function launchSim(){
     perturbPeakVar:0,
     // Idempotency flag for finalizeBaselineMean — prevents double-divide
     _baselineMeanFinalized:false,
-    // Idempotency flag for finalizing perturbation-phase means
+    // For finalizing perturbation-phase means
     _perturbMeanFinalized:false};
 
   resetResultBoard();
@@ -3757,8 +3159,6 @@ function loop(ts){
 
   // Apply live values
   GLOBAL_CFG.coupling=parseFloat(document.getElementById('s-cpl').value)||0.5;
-  // Noise rate is live-tunable from the setup slider (visible between/before runs).
-  // Clamp here too — a stale or out-of-range DOM value never escapes the cap.
   {
     const rawN=parseFloat(document.getElementById('s-noise')?.value);
     GLOBAL_CFG.noiseRate=Math.min(0.07, Math.max(0.001, Number.isFinite(rawN)?rawN:0.035));
@@ -3772,7 +3172,7 @@ function loop(ts){
   const canvas=document.getElementById('c0');
   const ctx=canvas.getContext('2d');
   const W=canvas.width,H=canvas.height;
-  // Hearing range from live slider — direct px value, rings show it on screen
+  // Hearing range from live slider.
   const liveNR=parseInt(document.getElementById('live-nr')?.value||200);
   s.gcfg.W=W;s.gcfg.H=H;s.gcfg.coupling=GLOBAL_CFG.coupling;s.gcfg.noiseRate=GLOBAL_CFG.noiseRate;
   s.gcfg.neighborR=liveNR;s.gcfg._dt=dt;
@@ -3791,8 +3191,6 @@ function loop(ts){
   const rr=s.robots;
 
   // ── Beat logging: Source A events ──
-  // Each emitted source A beat (after miss-rate filter) is logged with timestamp,
-  // downbeat flag, and current epoch state. Used for the beat-log CSV export.
   const elapsedRun = (typeof EPOCH_LAUNCH_T !== 'undefined' && EPOCH_LAUNCH_T > 0)
     ? (t - EPOCH_LAUNCH_T) : 0;
   for(const beat of beats){
@@ -3803,8 +3201,6 @@ function loop(ts){
       epoch: EPOCH_STATE
     });
   }
-
-  // (particles removed — source A broadcasts to all agents in range simultaneously)
 
   // Bottleneck mode: draw linear relay chain path A→B1→B2→…→B5→C
   if(ENV_MODE==='bottleneck'){
@@ -3822,13 +3218,13 @@ function loop(ts){
       ctx.lineTo(bx,by);
     }
     ctx.stroke();ctx.setLineDash([]);
-    // Source hearing radius — shows SOURCE_A_REACH, not neighborR
+    // Source hearing radius
     ctx.beginPath();ctx.arc(s.emitter.x,s.emitter.y,SOURCE_A_REACH,0,Math.PI*2);
     ctx.strokeStyle='rgba(240,176,74,0.18)';ctx.lineWidth=1;
     ctx.setLineDash([3,4]);ctx.stroke();ctx.setLineDash([]);
   }
 
-  // Chain guide lines (open/orbit mode: draw orbit ring around source A)
+  // Chain guide lines
   if(ENV_MODE!=='bottleneck'){
     const emCx=s.emitter.x,emCy=s.emitter.y;
     // Compute mean orbit radius from all agents
@@ -3843,7 +3239,6 @@ function loop(ts){
     ctx.setLineDash([2,6]);ctx.stroke();ctx.setLineDash([]);
 
     // Synchrony indicator: how spread-out are agents angularly?
-    // Perfect = evenly spaced (angular gaps ≈ 2π/N); show arc fill proportional to sync quality
     const angles=rr.map(r=>((r.orbitAngle%(Math.PI*2))+Math.PI*2)%(Math.PI*2)).sort((a,b)=>a-b);
     if(angles.length>1){
       const gaps=angles.map((a,i)=>{const next=angles[(i+1)%angles.length];return((next-a)+Math.PI*2)%(Math.PI*2);});
@@ -3857,7 +3252,7 @@ function loop(ts){
     }
   }
 
-  // Neighbor coupling links — live x,y positions
+  // Neighbor coupling links, live x,y positions
   if(showLinks){
     for(let i=0;i<rr.length;i++)for(let j=i+1;j<rr.length;j++){
       const a=rr[i],b=rr[j];
@@ -3873,7 +3268,7 @@ function loop(ts){
     }
   }
 
-  // Tick agents — pass emitter and envMode for source reception
+  // Tick agents pass emitter and envMode for source reception
   for(const r of rr){r.gcfg=s.gcfg;r.tick(t,rr,s.gcfg,s.tactic,s.emitter,ENV_MODE);r.update(dt,W,H);}
 
   // Draw orbit trails (orbit mode only)
@@ -3893,8 +3288,6 @@ function loop(ts){
     }
   }
 
-  // B5 → Lock: evaluate based on B5's actually-emitted beat phases (not its grid template).
-  // Requires B5 to have emitted enough beats over enough cycles before unlock can fire.
   const b5=rr[4];
   if(ENV_MODE==='bottleneck'&&b5&&b5.emittedBeatPhases.length>0){
     const dxL=b5.x-s.lock.x,dyL=b5.y-s.lock.y;
@@ -3911,11 +3304,10 @@ function loop(ts){
       s.lock.evaluate(b5.emittedBeatPhases, b5.model.cycle_period, b5.model.last_onset_time, t);
       if(!wasUnlocked&&s.lock.unlocked)onUnlockEvent(t);
     } else if(distToLock<liveNR*0.8&&s.lock.unlocked&&!phaseAligned){
-      // Phase drifted: close the unlock flag only (matched count kept for display)
       s.lock.unlocked=false;
     }
   } else if(ENV_MODE!=='bottleneck'&&b5&&b5.emittedBeatPhases.length>0){
-    // Orbit mode: require ALL agents to have emitted some beats AND be phase-aligned.
+
     const allHaveBeats=rr.every(r=>r.emittedBeatPhases.length>0);
     if(allHaveBeats){
       const emElapsed=(t-s.emitter.lastCycleT);
@@ -3931,7 +3323,6 @@ function loop(ts){
         s.lock.evaluate(b5.emittedBeatPhases, b5.model.cycle_period, b5.model.last_onset_time, t);
         if(!wasUnlocked&&s.lock.unlocked)onUnlockEvent(t);
       } else if(wasUnlocked){
-        // Lost phase alignment: close unlock flag only
         s.lock.unlocked=false;
       }
     }
@@ -3967,9 +3358,7 @@ function tickSwitchPhase(t){
 
   if(SWITCH_STATE.phase==='A'&&elapsed>=aCfg.aDur){
     // Phase A → B = perturbation onset. Snapshot the PRE-SWAP cipher first so
-    // we can pass it to markPerturbationOnset; once applySwitch runs,
-    // SIM.lock.cipher is the new (B) cipher, but agentCorrectAtShock should
-    // reflect whether agents were playing the OLD cipher correctly.
+    // we can pass it to markPerturbationOnset.
     const preSwapCipher = SIM ? [...SIM.lock.cipher] : [];
     SWITCH_STATE.phase='B';SWITCH_STATE.startT=t;applySwitch('B');
     markPerturbationOnset(t, preSwapCipher);
@@ -3994,23 +3383,6 @@ function applySwitch(phase){
     CIPHER=exported.cipher.map(c=>({...c,tOffset:c.tOffset*(newPeriod/rep)}));
     SIM.emitter.cipher=[...CIPHER];SIM.emitter.nextBeatIdx=0;SIM.emitter.lastCycleT=-1;
   }else if(SWITCH_TYPE==='pattern'){
-    // ── CYCLE-CONTINUITY PATCH ──
-    // Previously applySwitch reset lastCycleT=-1 on every pattern swap, letting
-    // the emitter pick a brand-new cycle start at an arbitrary frame time. This
-    // breaks downbeat alignment: the new cycle's beat-0 lands at a time that has
-    // no relationship to the original A-pattern's cycle grid, so agents receiving
-    // source-A downbeats re-anchor to a drifted position. After the B→A2 return,
-    // agents are stuck with a last_onset_time that can be up to one full cycle
-    // away from source A's true downbeat, and the existing soft-pull (errFrac <
-    // 0.50, alpha up to 0.90) only corrects ~90% per cycle — slow enough that
-    // the user perceives persistent onset misalignment through most of the A2 phase.
-    //
-    // Fix: when lastCycleT is already valid (>0), compute the equivalent cycle
-    // start that is phase-continuous with the current clock — i.e., the most
-    // recent multiple of repeatPeriod anchored to the current lastCycleT. The
-    // emitter then begins emitting pattern B (or A) beats from that same phase
-    // position, and any source-A downbeat that agents receive is locked to the
-    // same cycle grid they've been tracking all along.
     const now = performance.now() / 1000;
     let continuousLastCycleT = -1;
     if(SIM.emitter.lastCycleT > 0){
@@ -4031,12 +3403,6 @@ function applySwitch(phase){
       SIM.emitter.nextBeatIdx=0;
       SIM.lock.cipher=[...CIPHER_OFFSETS];
     }
-    // Signal all predictive agents that a pattern switch just occurred so they
-    // aggressively re-anchor on the next confirmed source-A downbeat (amp≥0.8).
-    // We use a simple per-agent flag; the model's process_event checks this and
-    // applies a near-instantaneous correction on the very first high-amp event
-    // it receives after the switch — as soon as the agent can confirm (via
-    // amplitude) that the signal it's hearing is a real downbeat, not noise.
     if(SIM.robots){
       for(const r of SIM.robots){
         if(r.hasRhythm && r.model) r.model._pendingPatternSwitch = true;
@@ -4083,17 +3449,6 @@ function tickEpoch(nowT){
 }
 
 // Reusable post-perturbation tracking helpers
-// These let both shock runs (PERT_STIMULI/PERT_AGENT) and switch runs (tempo or
-// pattern switch) populate the same RES fields used by the post-perturbation
-// result panel. The "perturbation onset" is shock onset for stim/agent runs and
-// phase-B onset for switch runs. The "perturbation end" is end-of-shock or
-// phase-A2 onset. "Recovery end" is the run end.
-
-// Convert the baseline accumulator (running sum) to a mean exactly once. Multiple
-// code paths can attempt this (markPerturbationOnset, tickEpoch end-of-baseline-only,
-// tickEpoch end-of-switch) and double-dividing produced the 1.7% bug seen in
-// switch runs where 1.0 / 100 samples → 0.01. The idempotent flag ensures the
-// divide happens at most once regardless of how many times we're called.
 function finalizeBaselineMean(){
   if(RES._baselineMeanFinalized) return;
   RES._baselineMeanFinalized = true;
@@ -4101,12 +3456,6 @@ function finalizeBaselineMean(){
   RES.baselineConfSum /= Math.max(1, RES.baselineConfN);
 }
 
-// Snapshot agent correctness against a specified cipher (the PRE-perturbation
-// cipher). For shock runs that's the same as the current cipher. For switch
-// runs we need to use the OLD cipher (cipher A) — the rhythm agents were
-// supposed to be playing — not the new one. Otherwise agents whose old-pattern
-// emissions coincidentally match the new cipher get marked "correct", which
-// produces the bug where retention=100% after a pattern switch.
 function markPerturbationOnset(nowT, preShockCipher){
   if(!SIM) return;
   RES.tShock = nowT;
@@ -4115,9 +3464,7 @@ function markPerturbationOnset(nowT, preShockCipher){
   finalizeBaselineMean();
   // Snapshot agent correctness against the PRE-shock cipher (the rhythm they
   // were supposed to be playing). For shock runs the cipher is unchanged, so
-  // this is the same as the current cipher. For switch runs we receive the
-  // OLD cipher A as a parameter — agents are measured on whether they were
-  // correctly playing what was in effect, not on the post-swap cipher.
+  // this is the same as the current cipher.
   const cipher = preShockCipher || SIM.lock.cipher;
   const tol = SIM.lock.tol;
   for(let i=0; i<5; i++){
@@ -4138,13 +3485,11 @@ function markPerturbationOnset(nowT, preShockCipher){
     RES.agentCorrectAtShock[i] = (m >= cipher.length && cipher.length > 0 && r.conf > 0.55);
   }
   // Reset peak-variance accumulator at perturbation onset so it reflects only
-  // the perturbation/recovery window, not stale baseline values.
+  // the perturbation/recovery window.
   RES.peakPhaseVar = 0;
 }
 
-// Compute retention rate at perturbation end. Agents that were correct at onset
-// and never got reclassified during the perturbation phase → 'none' (retained).
-// Also finalize perturbation-phase means (idempotent).
+// Compute retention rate at perturbation end.
 function finalizePerturbMean(){
   if(RES._perturbMeanFinalized) return;
   RES._perturbMeanFinalized = true;
@@ -4166,8 +3511,7 @@ function markPerturbationEnd(){
     ? retainedCount / correctAtShockCount : 0;
 }
 
-// Compute final recovery rate at run end. Corrupted agents that have a
-// recovery time recorded → recovered. Others → permanently disrupted.
+// Compute final recovery rate at run end.
 function markPerturbationAllDone(){
   let corruptedCount = 0, recoveredCount = 0;
   for(let i=0; i<5; i++){
@@ -4254,7 +3598,7 @@ function enterDone(nowT){
     perturb_conf_mean:(RES.perturbConfSum||0).toFixed(3),
     perturb_peak_var:RES.perturbPeakVar.toFixed(4),
     t_perturb_group_relock:RES.tPerturbationGroupRelock>=0?RES.tPerturbationGroupRelock.toFixed(2):'null',
-    // Match snapshot at onset (legacy compat)
+    // Match snapshot at onset
     match_depth_at_shock:RES.matchAtShock.toFixed(3),
     phase_var_peak:RES.peakPhaseVar.toFixed(4),
     ttr_seconds:RES.ttr>=0?RES.ttr.toFixed(2):'null',
@@ -4298,9 +3642,6 @@ function sampleMetrics(nowT){
   LAST_SAMPLE_T=nowT;const s=SIM;if(!s)return;
   const elapsed=nowT-EPOCH_LAUNCH_T;
   // Circular variance of internal phases (phases live on [0,1) and wrap).
-  // Compute via mean-vector length on the unit circle: V = 1 - R, where R is
-  // the magnitude of the average unit-vector. Linear variance treats wrap-around
-  // phases (e.g., 0.05 and 0.95) as far apart, which is wrong for cyclic data.
   const phases = s.robots.filter(r=>r.hasRhythm&&r.conf>0.1).map(r=>r.phase);
   let phaseVar = 0;
   if(phases.length > 1){
@@ -4316,18 +3657,6 @@ function sampleMetrics(nowT){
   const snapCount=s.robots.filter(r=>r.cipherSnap.length>0).length;
   const meanConf=s.robots.reduce((a,r)=>a+r.conf,0)/s.robots.length;
   // matchDepth: proportion of cipher targets covered by the best agent snap present.
-  // Use actual emitted-beat phases vs cipher (same logic as the lock) so this metric
-  // reflects what the agents are *doing*, not just what their internal grid template
-  // permits. An agent must have observed enough cycles AND emitted matching beats.
-  // matchScoreEmitted: count cipher targets covered by an agent's recent emissions.
-  //
-  // Gating: require at least MIN_BEATS_FOR_MATCH emitted beats before scoring.
-  // This prevents the metric from spuriously firing on the very first emission
-  // from the model's default-grid prior. We previously used "cycles since
-  // last_onset_time" but that anchor gets reset on every source A downbeat, so
-  // it never grew past 1.0 — rejecting all matches forever once a stable lock
-  // was achieved. Counting emitted beats is a cleaner observability gate.
-  const MIN_BEATS_FOR_MATCH = 4;  // ≥ 2 cycles of output for a 2-beat cipher
   function matchScoreEmitted(r){
     if(r.emittedBeatPhases.length < MIN_BEATS_FOR_MATCH) return 0;
     if(s.lock.cipher.length===0) return 0;
@@ -4356,7 +3685,7 @@ function sampleMetrics(nowT){
 
   // Track T₁ per agent: first time an agent's emitted beats correctly cover all cipher targets
   // AND it has observed enough cycles. This requires the agent to actually be producing the
-  // pattern, not just to have a grid template that *could* produce it.
+  // pattern, not just to have a grid template that could produce it.
   if(s.lock.cipher.length>0){
     for(let i=0;i<s.robots.length;i++){
       if(RES.agentFirstSync[i]>=0) continue;
@@ -4368,9 +3697,6 @@ function sampleMetrics(nowT){
   }
 
   // Baseline window:
-  //   shock runs:  EPOCH_BASELINE (until enterShock)
-  //   switch runs: EPOCH_BASELINE AND SWITCH_STATE.phase==='A' (until phase B starts)
-  //   baseline-only: EPOCH_BASELINE for the whole run
   const inBaseline = (EPOCH_STATE===EPOCH_BASELINE) &&
     !(SWITCH_TYPE!=='none' && SWITCH_STATE.phase!=='A');
   if(inBaseline){
@@ -4380,10 +3706,6 @@ function sampleMetrics(nowT){
     // cipher (full coverage) AND are confidently entrained.
     const activeAgents=s.robots.filter(r=>r.hasRhythm||r.hasSocial);
     if(RES.tGroupSync<0){
-      // Confidence threshold differs: predictive agents can reach full confidence
-      // (>0.65); reactive agents are capped at 0.5 by design (binary IOI estimate).
-      // Use per-agent threshold so reactive agents aren't permanently excluded from
-      // T_group, which caused A_sync to always read 0% in mixed/fully-reactive runs.
       const allSynced=activeAgents.every(r=>{
         const confThresh = r.hasRhythm ? 0.55 : 0.35; // reactive conf tops out ~0.5
         if(r.conf<confThresh)return false;
@@ -4401,23 +3723,17 @@ function sampleMetrics(nowT){
       }
     }
   }
-  // Perturbation and recovery windows. For shock runs these are EPOCH_SHOCK and
-  // EPOCH_RECOVERY. For switch runs (which stay in EPOCH_BASELINE the whole time),
-  // they're SWITCH_STATE.phase==='B' and SWITCH_STATE.phase==='A2' respectively.
+  // Perturbation and recovery windows.
   const inPerturbation = (EPOCH_STATE===EPOCH_SHOCK) ||
     (SWITCH_TYPE!=='none' && SWITCH_STATE.phase==='B');
   const inRecovery = (EPOCH_STATE===EPOCH_RECOVERY) ||
     (SWITCH_TYPE!=='none' && SWITCH_STATE.phase==='A2');
 
-  // Match score filtered to ONLY beats emitted after perturbation onset. Used
-  // for classification and recovery detection during shock/recovery so that
-  // pre-shock beats lingering in the 4-cycle buffer don't keep an agent
-  // looking "correct" against a possibly-changed cipher. Once enough post-onset
-  // beats are in the buffer, this becomes equivalent to matchScoreEmitted.
+  // Match score filtered to ONLY beats emitted after perturbation onset.
   function matchScorePostOnset(r){
     if(!r || RES.tShock < 0) return 0;
     const recent = r.emittedBeatPhases.filter(b => b.t >= RES.tShock);
-    if(recent.length < 4) return 0; // wait for ≥ 4 post-onset beats
+    if(recent.length < 4) return 0;
     if(s.lock.cipher.length === 0) return 0;
     let m = 0;
     for(const target of s.lock.cipher){
@@ -4433,18 +3749,12 @@ function sampleMetrics(nowT){
 
   if(inPerturbation){
     if(phaseVar>RES.peakPhaseVar)RES.peakPhaseVar=phaseVar;
-    // Perturbation-phase metric accumulation. Match here is against the
-    // perturbation-phase cipher (which IS s.lock.cipher during inPerturbation —
-    // it was swapped to B at switch onset for switch runs). Mean confidence
-    // and peak phase variance are tracked separately from baseline/recovery so
-    // each phase has its own clean metrics.
+    // Perturbation-phase metric accumulation.
     RES.perturbMatchSum += matchDepth; RES.perturbMatchN++;
     RES.perturbConfSum += meanConf;     RES.perturbConfN++;
     if(phaseVar > RES.perturbPeakVar) RES.perturbPeakVar = phaseVar;
     // Per-agent relock during phase B: the moment an agent's POST-onset emissions
-    // match the new cipher (within tol). For switches this is "did this agent
-    // correctly figure out the new pattern within the perturbation window?";
-    // for shocks, it's mostly the same as recovery (cipher unchanged).
+    // match the new cipher (within tol).
     if(s.lock.cipher.length>0 && RES.tShock>0){
       let allRelocked = true; let activeCount = 0;
       for(let i=0;i<5;i++){
@@ -4466,13 +3776,7 @@ function sampleMetrics(nowT){
     }
     // Detect per-agent corruption during the perturbation phase. For agents
     // that were correct at perturbation onset, monitor whether they lose
-    // correct sync. Classify the failure:
-    //   pattern_sub  — model still confident (>0.4) but emitted phases no longer
-    //                  match cipher targets → locked to a wrong rhythm structure
-    //   sync_loss    — model lost confidence (<0.4) → no stable entrainment
-    // Once classified, the type is sticky for this run (don't overwrite).
-    // Note: uses POST-onset match score so pre-onset beats can't keep the agent
-    // looking correct after a pattern swap.
+    // correct sync.
     if(s.lock.cipher.length>0){
       for(let i=0;i<5;i++){
         if(!RES.agentCorrectAtShock[i]) continue;
@@ -4656,15 +3960,13 @@ function updateEpochBar(){
       {id:2, dur:EPOCH_CFG.recovery, label:'↗ Recovery'}
     ];
   } else {
-    // Baseline only — single segment fills the whole bar.
+    // Baseline only, single segment fills the whole bar.
     phases = [
       {id:0, dur:EPOCH_CFG.baseline, label:'① Baseline'}
     ];
   }
 
   // Determine which segment is currently active, and how far into it we are.
-  // In switch mode the active phase comes from SWITCH_STATE.phase ('A','B','A2').
-  // In perturbation/baseline mode, EPOCH_STATE (0/1/2/3) drives it.
   let activeId, phaseElapsed;
   if(hasSwitch){
     activeId = SWITCH_STATE.phase==='A' ? 0 : SWITCH_STATE.phase==='B' ? 1 : 2;
@@ -4721,8 +4023,6 @@ function metricRow(label,val,cls,desc){return`<tr><td>${label}</td><td><span cla
 function buildResultsPanel(){
   const hasPert=PERT_STIMULI||PERT_AGENT;
   const hasSwitch=SWITCH_TYPE!=='none';
-  // Switches are a form of perturbation for the purpose of post-perturbation
-  // metrics. Phase B = perturbation onset, phase A2 = recovery.
   const hasAnyPerturbation = hasPert || hasSwitch;
   const comp=COMPOSITIONS[SELECTED_COMP_IDX];
   let pertLabel = 'Baseline only';
@@ -4748,7 +4048,6 @@ function buildResultsPanel(){
   // Post-perturbation: "returned A phase" onset = end of shock / start of recovery
   // For shock runs: EPOCH_PHASE_START when we entered RECOVERY
   // For switch runs: SWITCH_STATE start when phase moved to A2
-  // We approximate this as perturbation onset + perturbation duration
   const pertDurUsed = hasSwitch
     ? (SWITCH_TYPE==='tempo'
         ? (parseFloat(document.getElementById('sw-b-dur')?.value)||20)
@@ -4807,7 +4106,7 @@ function buildResultsPanel(){
         'Peak circular variance of agent phases during perturbation. Stays low for tempo/pattern switches where agents share an anchor; rises for stim/agent-noise shocks where agents drift apart in time.');
   }
 
-  // Post-perturbation — applies to shock perturbations AND switch runs.
+  // Post-perturbation, applies to shock perturbations AND switch runs.
   const postBody=document.getElementById('mm-post-body');
   if(!hasAnyPerturbation){
     postBody.innerHTML=metricRow('—','No perturbation configured','neutral','Run with a perturbation or switch to see post-perturbation metrics');
@@ -4861,7 +4160,7 @@ function buildResultsPanel(){
         'Peak circular variance of agent phases during perturbation+recovery. Stays low when agents share an anchor.');
   }
 
-  // ── Per-agent table — three result sections per agent ──
+  // ── Per-agent table, three result sections per agent ──
   const agentBody=document.getElementById('mm-agent-body');
   agentBody.innerHTML='';
   if(SIM){
@@ -4939,7 +4238,7 @@ function exportData(){
     if(PARAM_SNAPSHOT_ROWS.length>0)
       downloadCSV(rowsToCSV(PARAM_SNAPSHOT_ROWS),`syncofly_params_${runId}.csv`);
   },600);
-  // Live parameter-change log (timestamped). Always export — empty file with just
+  // Live parameter-change log (timestamped). Always export. Empty file with just
   // header is informative ("no changes during this run") and keeps file count consistent.
   setTimeout(()=>{
     if(PARAM_CHANGES.length>0){
@@ -4992,9 +4291,7 @@ document.getElementById('btn-reset').addEventListener('click',()=>{
     rb._lastBeatPhase=-1;rb._lastOrbitStepT=-999;
     rb.model._predictedDownbeatT=-999;
     rb.speed=0;rb._lastAudioT=-999.0;
-    // Reactive-mode state — pending taps and IOI estimate. Mirrors what the
-    // constructor sets up; without this reset, reactive agents would carry
-    // a stale tap queue and IOI estimate across runs.
+    // Reactive-mode state.
     rb._reactiveTaps=[];
     rb._reactiveLastEventT=-999;
     rb._reactiveCyclePeriod=INIT_CYCLE_PERIOD;
@@ -5002,7 +4299,6 @@ document.getElementById('btn-reset').addEventListener('click',()=>{
     rb._reactiveLastDownbeatT=-999;
     // All agents restart CCW (same as buildSim) so they don't collide on reset.
     rb.orbitDir=1;
-    // Restore env-mode-specific bottleneck flags + chain authority
     if(ENV_MODE==='bottleneck'){
       rb.bnActive=true;rb.bnArrived=true;
       rb._authoritySourceId = (rb.id===0) ? 'A' : `peer:${rb.id-1}`;
@@ -5018,7 +4314,6 @@ document.getElementById('btn-reset').addEventListener('click',()=>{
   r.emitter.cipher=[...CIPHER];r.lock.cipher=[...CIPHER_OFFSETS];
   TIME_SERIES_ROWS=[];EPOCH_SUMMARY_ROWS=[];BEAT_LOG_ROWS=[];LAST_SAMPLE_T=newLaunchT;
   PARAM_CHANGES=[];
-  // Re-seed live-param logger so post-reset changes log against current values
   if(typeof seedParamLog==='function') seedParamLog();
   RES={tShock:-1,matchAtShock:0,peakPhaseVar:0,ttr:-1,ttrRecorded:false,
     baselineMatchSum:0,baselineMatchN:0,recovMatchSum:0,recovMatchN:0,
@@ -5052,8 +4347,6 @@ const DM={j:{amp:1.0,type:'kick',freq:60},k:{amp:0.9,type:'snare',freq:200},f:{a
 document.addEventListener('keydown',e=>{
   if(!e.repeat){const d=DM[e.key.toLowerCase()];if(!d)return;playDrum(d.freq,d.amp,d.type);
     if(RUNNING&&!PAUSED){const t=performance.now()/1000;const r=SIM?.robots[0];if(r){
-      // Manual drum hit: deliver as a real audio event from a synthetic source
-      // ID per drum key, with zero distance (right next to the agent).
       r.receiveSound(t, d.amp, `drum:${e.key.toLowerCase()}`, 0, 1, d.amp >= 0.8);
       if(d.amp>=0.8){r.buildSnapshot();}
     }}
