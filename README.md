@@ -27,3 +27,6 @@ No build step required. Open 'syncofly_sab.html' in a modern browser (Chrome rec
 5. **Export**: download CSVs from the right panel for further analysis.
 
 ## Citation
+
+Wu, Y.: Syncofly. https://github.com/yanni-yanni/syncofly (2026)
+
