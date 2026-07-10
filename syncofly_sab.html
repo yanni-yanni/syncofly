@@ -3658,6 +3658,7 @@ function sampleMetrics(nowT){
   const meanConf=s.robots.reduce((a,r)=>a+r.conf,0)/s.robots.length;
   // matchDepth: proportion of cipher targets covered by the best agent snap present.
   function matchScoreEmitted(r){
+    const MIN_BEATS_FOR_MATCH = 4;  // ← add this back
     if(r.emittedBeatPhases.length < MIN_BEATS_FOR_MATCH) return 0;
     if(s.lock.cipher.length===0) return 0;
     let m=0;
