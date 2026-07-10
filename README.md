@@ -38,7 +38,7 @@ The batch run feature repeats the experiment N times under identical model setti
 
 Each predictive agent runs an instance of M4p (abbreviation for Grid Model), a hierarchical meter-predictive oscillator defined as a JavaScript class in the source file. If you want to replace this with a different timing model (i.e. a phase oscillator, a recurrent network, a Bayesian meter tracker, or anything else) you only need to satisfy the interface that Robot expects from its this.model object.
 
-**Where to look**
+**Where to look:**
 The M4p class definition begins around line 1091 (search for class M4p). The Robot class begins around line 1507 (search for class Robot). The model is instantiated inside the Robot constructor. The batch runner re-instantiates it at the same pattern. Replace both occurrences with your own class to use it everywhere.
 
 Robot reads three properties and calls three methods on this.model each frame: (1) cycle_period, (2) last_onset_time, (3) structural_memory.
