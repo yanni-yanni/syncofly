@@ -26,7 +26,7 @@ No build step required. Open 'syncofly_sab.html' in a modern browser (Chrome rec
 4. **Launch**: click Launch to begin the simulation. Specific live controls (hearing range, source reach) remain adjustable during the run.
 5. **Export**: download CSVs from the right panel for further analysis.
 
-## Batch Run
+## Batch Run (Updated: 2026/07/09.)
 The batch run feature repeats the experiment N times under identical model settings. This lets you assess the variability of outcomes (e.g., time-to-recover, retention rate) across stochastic replications without manually re-launching.
 
 **Enabling batch mode.** At the bottom of the setup dialog, expand the **Batch / Repeated Runs** section by checking its toggle. Set the number of runs using the slider (minimum 2, maximum 50). The badge next to the toggle updates to show the selected count.
