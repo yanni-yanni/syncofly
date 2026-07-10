@@ -602,8 +602,7 @@ input[type=range]{flex:1;accent-color:var(--accent);}
       </div>
       <div class="batch-body" id="batch-body">
         <div class="batch-desc">
-          Repeat the experiment N times using the <em>exact same model</em> — every agent,
-          coupling weight, and perturbation setting — with different random seeds.
+          Repeat the experiment N times using the <em>exact same set up</em>.
           The visualised run is Run 1. Silent background runs share all setup but use
           independent omission and noise seeds.<br>
           <span style="color:var(--accent3)">The canvas always shows Run 1.</span>
@@ -618,7 +617,7 @@ input[type=range]{flex:1;accent-color:var(--accent);}
         </div>
         <div class="batch-note">
           <b>Run 1</b> = the visualised run (same CSVs as always).<br>
-          <b>Runs 2–N</b> = headless, same model, independent random seeds.<br>
+          <b>Runs 2–N</b> = all else.<br>
           If Beat Omission is active, each run omits a <b>different random subset</b> of beats.<br>
           Batch CSVs include one row per run plus Run 1 prepended.
         </div>
@@ -1125,9 +1124,7 @@ class M4p{
     // (one that doesn't fit ratio≈1) is treated as a phase glitch (re-anchor
     // last_onset_time, leave cycle_period intact). Only a SECOND anomalous
     // IOI confirming the first triggers a real drastic reset that changes
-    // cycle_period. This matches listener behavior: you don't conclude the
-    // tempo changed from a single early downbeat — you wait for the next
-    // one to confirm. Stashed as {ioi, t}; null when no anomaly is pending.
+    // cycle_period.
     this._pendingDrastic=null;
     this.phase=0.0;this.confidence=0.0;
     // dbFlash for visual pulse (not in Python, added for display)
@@ -1146,39 +1143,7 @@ class M4p{
   //  ──────────────────────────────────────────────────────────────────────────
   //  The model has no external "a switch happened" notification path. When a
   //  pattern (or tempo) change occurs at the source, the agent must detect it
-  //  from the stimulus stream — exactly as a human listener does. The relevant
-  //  mechanisms, all already present in this class, are:
-  //
-  //    • Two-IOI confirmed drastic-reset (process_event downbeat branch):
-  //      one anomalous IOI (ratio far from 1.0) is treated as a phase glitch
-  //      — re-anchor last_onset_time, bump volatility, but PRESERVE
-  //      cycle_period. Only a SECOND anomalous IOI confirming the first
-  //      triggers an actual period change. This stops single pattern-switch
-  //      downbeats (which can arrive at arbitrary sub-cycle offsets relative
-  //      to the previous A-pattern downbeat) from corrupting the period.
-  //
-  //    • Off-layer penalty (sub-beat path): when sub-beats land on one
-  //      layer's grid but not the other's, the off-layer's weight decays.
-  //      Drives meter switches like 4/4 → 3/4 by demoting the L2 prior.
-  //
-  //    • Missed-prediction decay (check_missed_predictions): predicted taps
-  //      that don't receive a corroborating observation within ~40 ms*cp
-  //      decay their layer's weight by -0.3 each. For a dense L2 (e.g.
-  //      res=3, 8 ticks) trying to fit a 3/4 stimulus, 5 of every 6
-  //      predictions miss → L2 collapses within ~1 cycle, and once w<0.4
-  //      the resolution is decremented (l.res--) and the grid coarsens.
-  //
-  //    • Cycle-anchor resync (downbeat branch): on every non-drastic source
-  //      downbeat, last_onset_time is pulled toward the heard event time.
-  //      Errors up to 0.40 of a cycle get a graduated pull (α 0.45→0.75);
-  //      errors 0.40–0.50 snap fully (α=0.90) — handles anti-phase locks.
-  //
-  //  Together these handle 4/4↔3/4, 4/4↔8/8, 3/4↔8/8, and tempo changes
-  //  within 1–3 cycles of evidence. Early mistakes in the first cycle
-  //  (e.g. transient spurious sub-beats from the entrenched layer) are
-  //  expected and resolve as evidence accumulates — matching listener
-  //  behavior, not idealised teleportation to the new pattern.
-  //  ──────────────────────────────────────────────────────────────────────────
+  //  from the stimulus stream, as a human listener does.
   _update_ticks(g){
     const l=this.layers[g];const d=g*Math.pow(2,l.res-1);
     l.ticks=Array.from({length:d},(_,i)=>i/d);
@@ -1228,18 +1193,7 @@ class M4p{
     const active_ticks=new Set();
     if(use_mem){for(const ls of this.structural_memory)for(const tk of ls.ticks)active_ticks.add(Math.round(tk*1e4)/1e4);}
     else{
-      // Active-tick selection: original rule was simply `w > 0.5`. This
-      // misbehaves during meter switches: when L2=1.0 (entrenched 4/4) and
-      // L3 climbs above 0.5 (3/4 evidence accumulating), BOTH layers are
-      // active and the agent fires {0, ¼, ⅓, ½, ⅔, ¾} per cycle — the
-      // "spurious beeping" symptom. To fire ticks for a layer it must be
-      // (a) above the absolute floor (0.5) AND (b) within `META_GAP` of
-      // the maximum weight across layers. The gap rule preserves genuine
-      // polyrhythm support (when both layers entrain the polyrhythm cipher
-      // their weights both climb to ~1.0 → gap ≈ 0 → both active) while
-      // eliminating the cross-fire during a hesitant transition (L2=1.0,
-      // L3=0.55 → gap=0.45 > META_GAP → only L2 active until L3 actually
-      // takes over, after which Fix 2A drops L2 below 0.5 quickly).
+
       const META_GAP=0.30;
       const maxW=Math.max(this.layers[2].w, this.layers[3].w);
       for(const[,l]of Object.entries(this.layers)){
@@ -1262,15 +1216,7 @@ class M4p{
       // Within-frame deduplication (Python: 50ms gap between consecutive taps)
       const deduped=[raw[0]];
       for(const r of raw.slice(1))if(r.time-deduped[deduped.length-1].time>0.05)deduped.push(r);
-      // Cross-frame refractory: mirror Python's natural pp/cp tick-crossing guard.
-      // In Python, once last_sim_time advances past a tick, that tick cannot re-cross.
-      // In JS, all raw entries carry (t + LATENCY_MOTOR) so the same tick can re-fire
-      // next frame if last_sim_time didn't advance far enough.
-      //
-      // Dense-subdivision fix: the fixed 50ms refractory was too coarse at short
-      // periods with many subdivisions (e.g. 8/8 at 0.6s, IBI≈75ms → 50ms was eating
-      // ~40% of beats). Scale to 40% of the minimum IBI (same fraction as tauMinPeer),
-      // floored at 20ms so it still blocks same-frame double-fires at slow tempos.
+
       const _minIBI = Math.max(0.1, this.cycle_period) / Math.max(1, active_ticks.size);
       const REFRACTORY = Math.max(0.020, 0.40 * _minIBI);
       for(const item of deduped){
@@ -1280,7 +1226,7 @@ class M4p{
           if(item.isDownbeat){
             this._predictedDownbeatT=item.time;
             // Trigger white downbeat flash from the *predicted* tick≈0 crossing,
-            // same event that drives the orbit step — keeps visual in sync with movement
+            // same event that drives the orbit step, keeps visual in sync with movement
             this._dbFlash=1.0;
           }
         }
@@ -1304,15 +1250,8 @@ class M4p{
       this._lastDownbeatT=t;  // track most recent confirmed downbeat for orbit step
       // ── BOOTSTRAP-ON-FIRST-DOWNBEAT (un-anchored state) ──
       // last_onset_time<0 means the model is in an un-anchored bootstrap
-      // state — i.e., this is the very first downbeat event the model has
-      // ever processed. We have no prior cycle reference, so we latch the
-      // anchor to this downbeat and seed last_period_update with it so the
-      // NEXT downbeat can begin normal IOI-based period adaptation. We
-      // deliberately skip the IOI / resync / layer-boost paths below —
-      // none of them are meaningful with no prior anchor — and return
-      // immediately. Subsequent downbeats and sub-beats drive normal
-      // entrainment from here on, exactly as a listener latches their
-      // metrical anchor to the first heard downbeat of a rhythmic stream.
+      // state, i.e., this is the very first downbeat event the model has
+      // ever processed.
       if(this.last_onset_time < 0){
         this.last_onset_time = t;
         this.last_period_update = t;
@@ -1331,17 +1270,7 @@ class M4p{
           // at the intermediate positions (1/N, 2/N, ..., (N-1)/N). If those positions
           // are NOT in the pattern, the long gap reflects a genuine period change, and
           // the drastic-reset path must be allowed to fire.
-          //
-          // Example of the bug this fixes: user sets period=4s, 8-beat pattern
-          // (ticks at 0, 0.125, 0.25, ... fractions). Model starts at 2s (or gets
-          // stuck at 2s). First downbeat IOI = 4s → ratio=2. Old code: isMissedBeat=true
-          // (nearestMultiple=2, abs(2-2)=0<0.18) → drastic blocked → period never updates.
-          // But the pattern has NO tick at 0.5 (the only intermediate position for N=2),
-          // so there was no "skipped beat" — it's a real 4-second period.
-          //
-          // New check: isMissedBeat is only true when ALL intermediate positions
-          // k/nearestMultiple (k=1..nearestMultiple-1) have a matching tick in
-          // structural memory (within a loose 0.06-fraction tolerance).
+
           let isMissedBeat = false;
           if(this.structural_memory !== null
               && nearestMultiple >= 2 && nearestMultiple <= 6
@@ -1363,40 +1292,18 @@ class M4p{
           }
           const anomalous = !isMissedBeat && Math.abs(1.0-ratio)>DRASTIC_THRESHOLD;
           // ── TWO-IOI CONFIRMED DRASTIC-RESET ──
-          // The original code treated any anomalous IOI as a tempo change and
-          // snapped cycle_period to it. That's wrong when the anomaly is a
-          // PHASE event (e.g. a pattern switch firing mid-cycle: the new
-          // pattern's first downbeat arrives at a sub-cycle offset from the
-          // previous downbeat, but the cycle PERIOD hasn't changed). The fix:
-          // require TWO consecutive anomalous IOIs that AGREE with each other
-          // before changing the period. A single anomaly is treated as a phase
-          // reset only — re-anchor last_onset_time, bump volatility, KEEP
-          // cycle_period intact, and stash the IOI for confirmation. If the
-          // next downbeat arrives with a similar IOI, that confirms a real
-          // tempo change; if instead it arrives one cycle later (a normal
-          // ratio≈1), the anomaly was just a phase glitch and we're done.
-          // This matches listener behavior: you don't conclude the tempo
-          // doubled from a single early downbeat — you wait to confirm.
-          //
-          // Tolerance for "consistent IOIs": 15% relative — wider than
-          // DRASTIC_THRESHOLD because we're comparing two noisy measurements
-          // rather than to a clean reference.
           if(anomalous){
             // Stash expiration: if the previous anomaly is more than ~3
             // cycles old, it's no longer a valid candidate for confirming a
             // new tempo. This protects against the case where a long silence
-            // (or out-of-bounds IOI gap) sits between two unrelated anomalies
-            // — they shouldn't be allowed to confirm each other.
+            // (or out-of-bounds IOI gap) sits between two unrelated anomalies.
+            // They shouldn't be allowed to confirm each other.
             const stash = this._pendingDrastic;
             const stashFresh = stash !== null
               && (t - stash.t) < 3.0 * this.cycle_period;
             const consistent = stashFresh
               && Math.abs(stash.ioi - ioi) / Math.max(stash.ioi, ioi) < 0.15;
             if(consistent){
-              // Two confirming anomalies → real tempo change. Average the
-              // two IOIs (more robust to single-measurement jitter than
-              // snapping to the latest), do a full drastic reset, clear
-              // the pending state.
               const newPeriod = (stash.ioi + ioi) / 2;
               this.cycle_period = newPeriod;
               this.last_onset_time = t;
@@ -1418,9 +1325,7 @@ class M4p{
               // Single anomaly (or two inconsistent anomalies) → treat as
               // phase reset. Anchor moves to this downbeat; cycle_period is
               // preserved. Volatility bumps so layer-res can decrement if the
-              // anomaly persists. Stash this IOI for potential confirmation
-              // on the next downbeat. NO soft EMA period update — we don't
-              // trust this IOI yet. NO layer boost — we're not confident.
+              // anomaly persists.
               this.last_onset_time = t;
               this.last_reset = t;
               this.active_off = 0.0;
@@ -1431,21 +1336,16 @@ class M4p{
             }
           } else {
             // Normal cycle: ratio ≈ 1 (or a confirmed missed-beat). Clear
-            // any pending-drastic stash — whatever single anomaly we may
-            // have seen turned out to be a phase glitch, not a tempo
-            // change. Run the existing soft-EMA period update + dominant-
-            // layer boost, unchanged from the original logic.
+            // any pending-drastic stash.
             this._pendingDrastic = null;
-            // Period-adaptive EMA: at short cycle periods JS timing jitter is a larger
-            // fraction of the IOI, so use a gentler alpha to prevent noisy IOIs from
-            // destabilising the estimate. Scales 0.35 at 0.6s → 0.5 at 2.0s (capped).
+            // Period-adaptive EMA.
             const softAlpha = Math.min(0.5, 0.35 + 0.15*(this.cycle_period - 0.6)/1.4);
             this.cycle_period = (1 - softAlpha)*this.cycle_period + softAlpha*ioi;
             this._drasticReset = false;
             // Symmetric replacement of the legacy hard-coded binary prior:
             // boost whichever layer is CURRENTLY dominant. This preserves
-            // the original intent — downbeats reinforce the entrained meter
-            // — without privileging binary. Tie-break on equal weights goes
+            // the original intent, downbeats reinforce the entrained meter
+            // without privileging binary. Tie-break on equal weights goes
             // to L2 (a mild, principled prior at startup or polyrhythm).
             const domG = this.layers[2].w >= this.layers[3].w ? 2 : 3;
             this.layers[domG].w = Math.max(0.6, this.layers[domG].w);
@@ -1454,47 +1354,12 @@ class M4p{
       }
       this.last_period_update=t;
       // ── CYCLE-ANCHOR RESYNC to source A downbeat ──
-      // After the beat-position grid (sub-beat ticks) are learned, last_onset_time
-      // can drift from source A's actual cycle boundary because fine-tuning in the
-      // sub-beat matching path aligns to the nearest tick (which may NOT be tick=0).
-      // This manifests as agents playing the right beats but with the cycle offset
-      // from source A's phase — i.e., when source fires its downbeat, the agent
-      // thinks it is on beat 2 or 3. Fix: on every non-drastic source downbeat, if
-      // the model is already anchored (last_onset_time > 0), compute how far the
-      // current anchor is from a downbeat alignment with t, and pull it toward t.
-      //
-      // Pattern-switch tightening: previously the pull only fired for
-      // errFrac<0.15 (small error) and α was a fixed 0.35. After 4/4→3/4→4/4
-      // the agent's anchor at the end of phase B can sit at a 3/4-grid
-      // position that is offset from the new 4/4 cycle by a moderate amount
-      // (errFrac ~0.10–0.30, depending on when the switch fires), and at
-      // α=0.35 it took 4–5 cycles to fully converge — long enough that the
-      // user perceives the agent's downbeats as not lined up with source A
-      // for the first half of the recovery window. New behavior: the pull
-      // applies for errFrac<0.40, with α scaled from 0.45 (small error) up
-      // to 0.75 (large error). Errors ≥0.40 still fall through to the hard
-      // reset on the next downbeat (dtz>0.15 branch above), which already
-      // bumps volatility and re-anchors fully.
       if(this.last_onset_time > 0 && !this._drasticReset){
         const cp = Math.max(0.1, this.cycle_period);
         const elapsed = t - this.last_onset_time;
         const nearestCycleT = this.last_onset_time + Math.round(elapsed / cp) * cp;
         const anchorErr = t - nearestCycleT;
         const errFrac = Math.abs(anchorErr) / cp;
-        // ── EXTENDED RE-ANCHOR RANGE ──
-        // Previously capped at errFrac < 0.40. This was insufficient to recover
-        // from a wrong-downbeat lock: if a neighbor anchors to the anti-phase of
-        // the true downbeat (errFrac ≈ 0.5), the soft pull never fired (too large)
-        // and the hard reset never fired (dtz < 0.15 on most sub-beats). The agent
-        // would sit permanently at the wrong downbeat.
-        //
-        // Fix: raise the ceiling to 0.50 (the maximum possible circular error).
-        // In the 0.40–0.50 band, α=0.90 — a near-full correction on the very next
-        // source-A downbeat. Combined with the INITIATION NOISE GATE (which
-        // prevents neighbors from locking the wrong downbeat in the first place),
-        // this serves as a reliable escape hatch for the rare cases where the
-        // wrong-downbeat lock still occurs. Errors < 0.40 keep the original
-        // graduated pull (α 0.45→0.75) so normal jitter correction is unchanged.
         if(errFrac < 0.50){
           const alpha = errFrac >= 0.40
             ? 0.90                                            // wrong-downbeat zone: snap in one cycle
@@ -1502,14 +1367,6 @@ class M4p{
           this.last_onset_time += Math.min(0.90, alpha) * anchorErr;
         }
       }
-      // dbFlash now driven by predicted tick≈0 in generate_motor_commands, not stimulus
-      // Downbeat processing is complete — do NOT fall through to the sub-beat
-      // matching path below. The resync already adjusted last_onset_time to align
-      // the cycle boundary with t. If sub-beat matching also runs on this same
-      // event it computes raw_phase from the already-modified anchor (raw_phase
-      // near 0), matches it to tick=0, and applies an additional correction that
-      // fights the resync — the anchor oscillates rather than converging to the
-      // true downbeat position. Sub-beat matching is for non-downbeat events only.
       return;
     }
     // Python: last_onset_time starts at 0.0, so this branch only runs if explicitly set <0
@@ -1517,20 +1374,18 @@ class M4p{
     const td=t-this.last_onset_time;
     // Wrap raw_phase to [0,1) properly. JS's % returns negative for negative td,
     // which would make dtz negative and skip the phase-error branch incorrectly
-    // when an event arrives slightly before the current anchor (possible due to
-    // wall-clock vs sim-time jitter at frame boundaries).
+    // when an event arrives slightly before the current anchor.
     const rp=((td%this.cycle_period)/this.cycle_period+1)%1;
     const dtz=Math.min(rp,1.0-rp);
     // Python: dtz > 0.15 (not 0.20)
     if(amp>0.8&&dtz>0.15){
       this.last_onset_time=t;this.last_reset=t;
-      this.volatility+=0.5;this.pending=[];  // Python: += 0.5 not 0.4
+      this.volatility+=0.5;this.pending=[];
       if(!this.reactive_mode&&this.last_period_update>0){
         this._enter_reactive(t);this._reactive_taps.push(t+LATENCY_MOTOR);
       }
       return;
     }
-    // Python: volatility > 0.9: decay -0.1 per layer (not -0.08)
     if(this.volatility>0.9){
       for(const g of[2,3]){
         const l=this.layers[g];
@@ -1539,7 +1394,6 @@ class M4p{
       }
     }
     const raw_phase=((td%this.cycle_period)/this.cycle_period+1)%1;
-    // Python: skip if raw_phase < 0.02 or > 0.98
     if(raw_phase<0.02||raw_phase>0.98){
       if(this._should_enter_reactive(t))this._enter_reactive(t);
       if(this.reactive_mode)this._reactive_taps.push(t+LATENCY_MOTOR);
@@ -1549,23 +1403,13 @@ class M4p{
     for(const[gk,l]of Object.entries(this.layers)){
       const g=parseInt(gk);
       const bd=Math.min(...l.ticks.map(tk=>Math.min(Math.abs(raw_phase-tk),1.0-Math.abs(raw_phase-tk))));
-      // Period-relative tolerance: target a ~40 ms real-time window expressed as a cycle
-      // fraction (= 0.040 / cycle_period). At slow tempos this is smaller than the
-      // proportional floor (0.04/l.res) so the proportional value wins; at fast tempos
-      // the real-time floor prevents the window from collapsing below ~40 ms wall-clock.
+      // Period-relative tolerance.
       const _cp=Math.max(0.1,this.cycle_period);
       // matchTol: target a ~40 ms real-time window expressed as a cycle fraction.
-      // At slow tempos the proportional floor (0.04/l.res) is smaller so the
-      // real-time value wins; at fast tempos the real-time value would otherwise
-      // exceed the subdivision width, causing adjacent ticks to be simultaneously
-      // matched. Hard cap at 0.45/l.res so the window is always narrower than
-      // half the subdivision spacing — this keeps layer discrimination intact
-      // during pattern-switch adaptation regardless of tempo.
       const matchTol=Math.min(0.45/l.res, Math.max(0.04/l.res, 0.040/_cp));
       if(bd<matchTol){
         cands.push({g,type:'current',err:bd});
       }else if(t>this.layer_supp[g]&&this.volatility<0.5){
-        // Python: try_res goes up to 4 (range l.res+1, 5)
         for(let try_res=l.res+1;try_res<=4;try_res++){
           const d=g*Math.pow(2,try_res-1);
           const nts=Array.from({length:d},(_,i)=>i/d);
@@ -1576,54 +1420,21 @@ class M4p{
         }
       }
     }
-    // Python: passive decay -0.015 (not -0.02)
     for(const g of[2,3])this.layers[g].w=Math.max(0.05,this.layers[g].w-0.015);
-    // Pre-upgrade miss (Condition 4)
     const all_cur=Object.values(this.layers).filter(l=>l.w>0.3).flatMap(l=>l.ticks);
     const pre_miss=all_cur.length>0?Math.min(...all_cur.map(tk=>Math.min(Math.abs(raw_phase-tk),1.0-Math.abs(raw_phase-tk)))):0.0;
     if(cands.length>0){
-      // Python uses min(cands, key=lambda x: x['err']) which returns the FIRST
-      // minimum element on ties. JS reduce with `<` returns the LAST. Tie-break
-      // matters: when L2 and L3 both match perfectly (err=0), L2 should win
-      // (current match, +0.4 boost), not L3 (upgrade, +0.5 boost). Wrong tie-break
-      // causes a perfectly-locked binary pattern to keep upgrading the ternary
-      // layer to a 6-tick grid that fires extra spurious sub-beat ticks.
       let best = cands[0];
       for(let i=1; i<cands.length; i++){
         if(cands[i].err < best.err) best = cands[i];
       }
       const l=this.layers[best.g];
-      // Python: +0.5 on upgrade, +0.4 on current match
       if(best.type==='upgrade'){l.res=best.target_res;this._update_ticks(best.g);l.w=Math.min(1.0,l.w+0.5);}
       else{l.w=Math.min(1.0,l.w+0.4);}
       const og=best.g===2?3:2;
       const ol=this.layers[og];
       const obd=Math.min(...ol.ticks.map(tk=>Math.min(Math.abs(raw_phase-tk),1.0-Math.abs(raw_phase-tk))));
-      // Off-layer penalty. Original Python: flat -0.1.
-      //
-      // Asymmetric-meter-switch fix: when the dominant layer is saturated near
-      // 1.0 (e.g. L2 after long 4/4 baseline), a flat -0.1 cannot decay it
-      // below 0.5 within the perturbation window. Per cycle of 3/4 from a 4/4
-      // baseline: 2 sub-beat events × -0.115 = -0.23 → ~3 cycles to drop L2
-      // out, which is too slow given that the 3/4 phase is itself only a few
-      // cycles long. This produces the observed "spurious beeping" (both
-      // layers active simultaneously, agent fires {0,¼,⅓,½,⅔,¾} per cycle
-      // instead of just {0,⅓,⅔}) and means the meter-switch never resolves.
-      //
-      // Scaled penalty: -0.1 - 0.10*ol.w. At ol.w=1.0 the penalty is -0.20
-      // (2× original), at ol.w=0.5 it's -0.15 (1.5× original), at low weights
-      // it's near the original. Calibrated so:
-      //   • 4/4→3/4 transition: L2 drops below 0.5 in ~1.5 cycles instead
-      //     of never (with the binary-prior boost) or ~3 cycles (without
-      //     the prior).
-      //   • 3/4→4/4 transition: L3 drops below 0.5 in ~1 cycle, similar
-      //     to original.
-      //   • Polyrhythm cipher (events at {0, ⅓, ½, ⅔}): L2 reaches an
-      //     equilibrium of ~0.7 (above the 0.5 active-tick threshold)
-      //     instead of saturating to 1.0 — both layers still active and
-      //     fire their respective ticks. A stronger scale (e.g. 0.15)
-      //     would push L2 below 0.5 in polyrhythm, breaking it.
-      // Symmetric for both directions of meter switch.
+      // Off-layer penalty.
       if(obd>=0.05)ol.w=Math.max(0.05, ol.w - 0.1 - 0.10*ol.w);
       if(this.volatility<0.5){
         const sl=this.layers[best.g];let mds=1.0;
@@ -1632,24 +1443,7 @@ class M4p{
           if(d>0.5)d-=1.0;else if(d<-0.5)d+=1.0;
           if(Math.abs(d)<Math.abs(mds))mds=d;
         }
-        // Python: 0.3 * mds (not 0.25)
-        // Use the Python reference gain of 0.3 unconditionally. An earlier version
-        // scaled this down at short periods (0.3 * min(1, cp/2.0)) to prevent
-        // "too many corrections per second" at high subdivision rates. In practice
-        // that scaling was the root cause of dense-subdivision drift: it reduced
-        // the correction so much (0.09 at cp=0.6s) that accumulated IOI jitter was
-        // never adequately corrected, and agents drifted forward/backward relative
-        // to source A over many cycles. The refractory in generate_motor_commands
-        // already prevents runaway re-firing; the correction gain itself should stay
-        // at the calibrated 0.3 regardless of tempo.
         const phaseGain = 0.3;
-        // Capture period BEFORE modifying it. raw_phase was computed with the
-        // old period, so the anchor back-calculation must also use the old period.
-        // Using this.cycle_period AFTER the period update mixes two different time
-        // scales — the phase is in old-period units, the period is in new-period
-        // units — placing the anchor slightly wrong on every sub-beat correction.
-        // Accumulated over a pattern switch (many rapid corrections in a short
-        // window) this is what causes the visible downbeat misalignment.
         const cpBefore = this.cycle_period;
         this.cycle_period += phaseGain * (mds * cpBefore);
         this.last_onset_time = t - ((raw_phase - mds) * cpBefore);
@@ -1675,7 +1469,7 @@ class M4p{
   check_missed_predictions(t){
     if(this.last_onset_time<0)return;
     const tso=t-this.last_obs_time;
-    // Python: is_silent threshold = cycle_period * 1.01 (not 1.5)
+    // Python: is_silent threshold = cycle_period * 1.01
     const is_silent=tso>(this.cycle_period*1.01);
     const pp=(this.last_sim_time-0.005-this.last_onset_time)/this.cycle_period;
     const cp=(t-this.last_onset_time)/this.cycle_period;
@@ -1689,18 +1483,15 @@ class M4p{
           this.pending.push({time:this.last_onset_time+tgt*this.cycle_period,g,tick:tk});
       }
     }
-    // Python: check at t > pred.time + 0.1, window = 0.04 * cycle_period, penalty -0.3
     const still=[];
     for(const pred of this.pending){
       if(t<pred.time+0.1){still.push(pred);continue;}
       const window=0.04*this.cycle_period;
       if(Math.abs(pred.time-this.last_obs_time)>=window&&!is_silent){
         const l=this.layers[pred.g];
-        l.w=Math.max(0.0,l.w-0.3);  // Python: -0.3 not -0.22
+        l.w=Math.max(0.0,l.w-0.3);
         if(l.w<0.4&&l.res>1){l.res--;this._update_ticks(pred.g);
-          // Period-relative suppression: block upgrade attempts for 2 cycles.
-          // At 1.0s fixed this was 1.67 cycles at 0.6s but only 0.5 cycles at 2.0s.
-          // 2 × cycle_period gives consistent protection regardless of tempo.
+          // Period-relative suppression.
           this.layer_supp[pred.g]=t+2.0*this.cycle_period;}
       }
     }
@@ -1729,36 +1520,14 @@ class Robot{
     this._lastAudioT=-999.0;  // per-agent audio refractory (prevents coupling buzz)
     this.isNoisy=caps.noisy||false;
     this.cipherSnap=[];this.snapAge=0;this.lastDeliveredPhase=null;
-    // Recent emitted beat phases (within last ~4 cycles) for the lock evaluation.
-    // Each entry: {phase: 0..1 within cycle, t: wallclock seconds, isDownbeat: bool}
     this.emittedBeatPhases=[];
-    // Per-source refractory tracker: sourceId → last event time received from that source.
-    // Prevents the same beat from being counted twice if it reaches the agent via more
-    // than one path (e.g. two neighbors both broadcast a beat the agent already heard).
     this._lastEventBySource = new Map();
-    // Source-A authority: tracks most recent Source A event time. While A has
-    // been heard within the last ~2 cycles, peer events do not feed the model.
-    // -999 means "never heard A" — peers can drive the model from the start.
     this._lastSourceAEventT = -999;
-    // Second-to-last Source A event time. Used to estimate A's local cycle period
-    // for the multi-source conformity check: an incoming peer beat is "on grid"
-    // iff its time, modulo (lastA - prevA), is close to zero relative to lastA.
     this._prevSourceAEventT = -999;
     // Last time a peer event was allowed to drive process_event. Used to enforce
-    // a τ_min-style rate limit on peer-driven model updates: an echo cascade can
-    // accelerate the group's effective tempo by feeding the model more events
-    // per cycle than the rhythm structure supports. The reactive-output τ_min in
-    // §3.3.1 of the writeup prevents this for reactive agents; the predictive
-    // analogue is to cap the rate at which peer events can update the predictive
-    // model, since after a peer beat reinforces the model the next predicted
-    // tap fires sooner, broadcasts sooner, and accelerates neighbors in turn.
-    // Source A drives are exempt — A is the canonical timing reference.
+    // a τ_min-style rate limit on peer-driven model updates.
     this._lastPeerDriveT = -999;
-    // Recent peer events (rolling buffer, ~1.5 cycles deep) for the cross-reference
-    // consensus check: when a peer beat arrives, count how many OTHER peers fired
-    // within a small window around the same expected grid slot. Majority agreement
-    // boosts each peer's effective weight; an isolated outlier (the noisy agent)
-    // gets attenuated. Each entry: {sourceId, t}.
+    // Recent peer events.
     this._recentPeerEvents = [];
     // Simultaneous-peer cluster collapse: tracks most recent peer event time.
     // If multiple peers fire the same beat within 50ms, treat as one event so
@@ -1829,38 +1598,10 @@ class Robot{
   // physical analogy: a group of dancers follows the conductor on stage as the
   // primary timing reference, while still cross-checking each other in their
   // immediate hearing range. A single off-rhythm neighbor doesn't derail the
-  // group — the majority of correctly-entrained peers reinforce each other and
+  // group, the majority of correctly-entrained peers reinforce each other and
   // overpower the outlier, and everyone keeps anchoring to the conductor.
   //
-  // Concretely, when a peer event arrives and Source A has been heard recently:
-  //   1. Predict the A grid: from the last two Source A event times we estimate
-  //      A's local cycle period and project forward expected beat times.
-  //   2. Conformity to A: how close is this peer's beat to the nearest expected
-  //      A-grid time? On-grid → factor near 1. Far off-grid (e.g. a phantom
-  //      beat from a noisy agent at ±40% of cycle) → factor near 0.
-  //   3. Peer consensus: how many OTHER peers within hearing range fired a
-  //      similar on-grid beat in the recent window? Multiple agreeing peers
-  //      reinforce each other; an isolated outlier sits alone and gets minimal
-  //      boost. If only one peer is in range, this term gracefully degrades to
-  //      a neutral value (no boost, no penalty) — partial-hearing agents still
-  //      function purely on the A-conformity term.
-  //   4. The peer event drives the model with effective amplitude
-  //      base × conformity × consensusBoost, capped well below A's own weight
-  //      so A always dominates timing.
-  //   5. If the resulting amplitude is below a small floor (sub-noise), the
-  //      model update is skipped — the visual ripple still fired earlier so the
-  //      user sees that the agent IS hearing the peer; it just doesn't trust
-  //      that beat enough to act on it.
-  //
-  // When Source A is silent (out of range, perturbed, or never heard), peers
-  // fall back to driving the model directly with their full base weight — the
-  // existing relay-network behavior is preserved, so bottleneck-style chains
-  // and peer-only conditions still work.
-  //
-  // Bottleneck mode (this._authoritySourceId !== 'A') keeps the strict
-  // single-upstream-peer chain gate untouched: only the designated upstream
-  // peer's events drive the model. The weighted multi-source logic applies
-  // only when A is the authority.
+
   receiveSound(t, amp, sourceId, distance, reach, isDownbeat){
     // Both predictive (hasRhythm=true) and reactive (hasRhythm=false) agents
     // pass through this function. They share the same source-distinguishing /
@@ -1877,7 +1618,7 @@ class Robot{
     // cluster would compress all sound sources into one runaway feedback chain
     // (each echo triggers another echo within 25–50 ms, faster every cycle).
 
-    // Effective period for refractory/window calculations — reactive agents use
+    // Effective period for refractory/window calculations, reactive agents use
     // their own IOI estimate, predictive agents use the model's cycle_period.
     const effectivePeriod = this.hasRhythm ? this.model.cycle_period : this._reactiveCyclePeriod;
 
@@ -1894,10 +1635,7 @@ class Robot{
     if(falloff <= 0) return; // out of range — no event delivered
 
     // Source weight: prefer per-agent override snapshotted onto the bot at
-    // launch (this._srcW / this._peerW). Fall back to the live-panel slider so
-    // mid-run global slider changes still work for shared-weight runs. Use
-    // Number.isFinite so explicit 0 means "ignore" (the old `|| 1.0` trick
-    // silently rewrote 0 → 1).
+    // launch (this._srcW / this._peerW).
     const isFromA = (sourceId === 'A');
     let srcW;
     if(isFromA){
@@ -1917,7 +1655,7 @@ class Robot{
     }
     if(srcW <= 0) return; // user has dialed this source to "ignore"
 
-    // Visual ripple — fire for any real event regardless of model gating, so the
+    // Visual ripple fires for any real event regardless of model gating, so the
     // user can see that the agent IS receiving peer broadcasts even when those
     // broadcasts don't drive the model.
     this.signalRipple = 1.0;
@@ -1931,17 +1669,6 @@ class Robot{
     }
 
     // ── WEIGHTED MULTI-SOURCE GATE ──
-    // The constants below define the soft "hearing window" around each expected
-    // A-grid beat: tolerance ≈ 18% of A's period is wide enough to admit normal
-    // entrainment jitter (a well-locked agent's beat sits within a few percent
-    // of the grid) but tight enough to reject the ±0–40% phantom offsets the
-    // noise injection produces. PEER_BASE_WEIGHT (≤ 30% of A's weight) and
-    // PEER_FLOOR (sub-noise drop threshold) together keep peers as a social
-    // cross-check, never the dominant timing signal — even if the user dials
-    // the peer weight slider all the way up. The consensus boost is intentionally
-    // modest so that a single off-rhythm peer surrounded by entrained peers can't
-    // hijack the group: it has to actually fire near the same time as the others
-    // (not just at the same grid slot) to be reinforced.
     const A_TOL_FRAC = 0.18;        // peer beat within ±18% of an A-grid slot ⇒ on-grid
     const PEER_FLOOR = 0.15;        // skip model update if effective amp < this
     const PEER_BASE_WEIGHT = 0.30;  // peers max ≤ ~30% of A's weight even at full agreement
@@ -1962,7 +1689,7 @@ class Robot{
       }
       this._lastSourceAEventT = t;
     } else {
-      // Non-A event: bottleneck-mode chain authority is unchanged — only the
+      // Non-A event: bottleneck-mode chain authority is unchanged, only the
       // designated upstream peer drives the model. Other peers ripple visually
       // but do not feed process_event.
       if(authId !== 'A' && sourceId !== authId) return;
@@ -1983,21 +1710,17 @@ class Robot{
       this._lastAnyPeerEventT = t;
 
       // Record this peer event in the rolling consensus buffer BEFORE computing
-      // weights — it counts as one of the voices for any subsequent peer beat,
-      // and (harmlessly) as a self-vote for itself in the consensus check below.
+      // weights.
       this._recentPeerEvents.push({sourceId, t});
 
       // Multi-source weighting only applies in open/orbit mode (authId === 'A').
-      // In bottleneck mode the chain authority is sole-driver by design.
       if(authId === 'A'){
         const aLast = this._lastSourceAEventT ?? -999;
         const A_REF_WINDOW = effectivePeriod * 2.0;
         const aFresh = (t - aLast) < A_REF_WINDOW && aLast > 0;
 
         if(aFresh){
-          // Estimate A's local period. Prefer the gap between the last two A
-          // events; fall back to the agent's effective period (model or
-          // reactive estimate) when only one A event has been heard.
+          // Estimate A's local period.
           let aPeriod = effectivePeriod;
           if(this._prevSourceAEventT > 0){
             const ap = this._lastSourceAEventT - this._prevSourceAEventT;
@@ -2018,24 +1741,9 @@ class Robot{
 
           // Peer-consensus boost. Look at OTHER peers' recent events within
           // ±AGREE_WIN_FRAC of the period AROUND THE INCOMING BEAT'S TIME, not
-          // around an A-grid slot. The earlier (incorrect) version measured
-          // agreement against an A-grid slot, which meant correctly-entrained
-          // peers anywhere within ±half-period of the noisy beat counted as
-          // agreeing — even though they fired at the actual grid slot, not at
-          // the noisy beat's time. That falsely boosted any slightly-off-grid
-          // noisy beat by the rest of the group's correct beats.
-          //
-          // The correct check: a peer "agrees" with this beat only if it fired
-          // within AGREE_WIN_FRAC of the period of THIS event's time. Two
-          // beats at the same grid slot fired by different peers DO agree
-          // (small jitter ⇒ small temporal separation). A correctly-entrained
-          // peer's beat at grid slot N versus a noisy peer's beat 25%-off at
-          // slot N do NOT agree (they're temporally far apart).
-          const AGREE_WIN_FRAC = 0.07; // ±7% of period — tight enough that a beat
-                                       // a few percent off-grid does NOT pick up
-                                       // consensus from on-grid peers; loose enough
-                                       // for normal entrainment jitter to still
-                                       // count co-firing peers as agreeing.
+          // around an A-grid slot.
+
+          const AGREE_WIN_FRAC = 0.07;
           const agreeWin = aPeriod * AGREE_WIN_FRAC;
           const agreeingIds = new Set();
           for(const e of this._recentPeerEvents){
@@ -2062,14 +1770,14 @@ class Robot{
           const consensusBoost = Math.min(1.4, 1.0 + 0.15 * agreeingIds.size);
 
           // If conformity is essentially zero (off-grid phantom beat from a
-          // noisy peer) AND no other peers corroborate, drop entirely — the
+          // noisy peer) AND no other peers corroborate, drop entirely. The
           // crowd hears it for what it is and doesn't follow.
           //
           // REACTIVE EXCEPTION: When the user has explicitly set peer weight
           // higher than source-A weight (_peerW > _srcW), a reactive agent
           // should beep at positions its predictive peers are beeping even when
           // source A is silent there (e.g. peer fires at 0.75 but A only fires
-          // at 0, 0.25, 0.5 — the peer beat has conformity=0 but should still
+          // at 0, 0.25, 0.5, the peer beat has conformity=0 but should still
           // drive the reactive follower). The A-conformity hard drop is a
           // protection for the M4p predictive model; reactive agents have no
           // model to protect, so we honour the user's explicit intent instead.
